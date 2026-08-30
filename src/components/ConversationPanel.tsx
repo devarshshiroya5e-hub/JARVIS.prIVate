@@ -57,7 +57,7 @@ export const ConversationPanel: React.FC<ConversationPanelProps> = ({
     try {
       await voiceEngine.speak(text, language);
     } finally {
-      if (speakingId === id) setSpeakingId(null);
+      setSpeakingId((current) => current === id ? null : current);
     }
   };
 
