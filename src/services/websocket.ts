@@ -292,8 +292,6 @@ export class JarvisWebSocketClient {
         return { opened: true, reused: true };
       }
 
-      // Avoid rel=noopener here because Chromium may return null for a newly
-      // opened window, preventing us from reusing it for subsequent tool calls.
       const opened = window.open(url, '_blank');
       if (opened) {
         try { opened.opener = null; } catch (_) {}
@@ -343,7 +341,6 @@ export class JarvisWebSocketClient {
     const tool = String(msg.payload?.tool || '');
     const args = (msg.payload?.arguments || {}) as Record<string, any>;
 
-    // Web-only browser actions work even without the Windows companion.
     const browserFallback = this.tryBrowserFallback(tool, args);
     if (browserFallback) {
       const resultMsg: WebSocketMessage = {
@@ -354,6 +351,16 @@ export class JarvisWebSocketClient {
       };
       if (this.backendWs?.readyState === WebSocket.OPEN) this.backendWs.send(JSON.stringify(resultMsg));
       this.notifyMessage(resultMsg);
+
+      // If Chrome blocks a background popup, a final search task can still be
+      // completed by navigating the current tab after the backend has received
+      // the successful tool result. We only do this for search_web so an
+      // intermediate open_url call cannot destroy the JARVIS session mid-task.
+      if (tool === 'search_web' && browserFallback.popupBlocked && browserFallback.url) {
+        window.setTimeout(() => {
+          try { window.location.assign(browserFallback.url); } catch (_) {}
+        }, 250);
+      }
       return;
     }
 
