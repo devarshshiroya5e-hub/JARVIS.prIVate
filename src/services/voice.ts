@@ -17,6 +17,7 @@ export class VoiceEngine {
   private audioContext: AudioContext | null = null;
   private voicesReady = false;
   private speechGeneration = 0;
+  private speechWatchdogTimer: number | null = null;
 
   public isListening = false;
   public isSpeaking = false;
@@ -194,31 +195,6 @@ export class VoiceEngine {
     if (notify) this.onStateChange?.(false);
   }
 
-  private async waitForVoices(timeoutMs = 1500) {
-    if (typeof window === 'undefined' || !('speechSynthesis' in window)) return [] as SpeechSynthesisVoice[];
-    const synth = window.speechSynthesis;
-    const existing = synth.getVoices();
-    if (existing.length) {
-      this.voicesReady = true;
-      return existing;
-    }
-    await new Promise<void>((resolve) => {
-      let done = false;
-      const finish = () => {
-        if (done) return;
-        done = true;
-        synth.removeEventListener('voiceschanged', finish);
-        resolve();
-      };
-      synth.addEventListener('voiceschanged', finish, { once: true });
-      window.setTimeout(finish, timeoutMs);
-      try { synth.getVoices(); } catch (_) {}
-    });
-    const voices = synth.getVoices();
-    this.voicesReady = voices.length > 0;
-    return voices;
-  }
-
   private selectVoice(voices: SpeechSynthesisVoice[], targetLang: string, gender: 'male' | 'female') {
     const langPrefix = targetLang.toLowerCase().split('-')[0];
     const langVoices = voices.filter((v) => v.lang.toLowerCase().startsWith(langPrefix));
@@ -227,7 +203,7 @@ export class VoiceEngine {
       return langVoices.find((v) => /hindi|india/i.test(v.name)) || langVoices[0];
     }
     if (gender === 'male') {
-      return langVoices.find((v) => /male|daniel|george|alex|david|mark/i.test(v.name)) || langVoices.find((v) => v.lang.toLowerCase() === 'en-gb') || langVoices[0];
+      return langVoices.find((v) => /male|daniel|george|alex|david|mark/i.test(v.name)) || langVoices[0];
     }
     return langVoices.find((v) => /female|samantha|zira|susan|karen/i.test(v.name)) || langVoices[0];
   }
@@ -247,6 +223,17 @@ export class VoiceEngine {
     return chunks;
   }
 
+  private finishSpeaking() {
+    if (this.speechWatchdogTimer !== null) {
+      window.clearTimeout(this.speechWatchdogTimer);
+      this.speechWatchdogTimer = null;
+    }
+    if (this.isSpeaking) {
+      this.isSpeaking = false;
+      this.onSpeakingChange?.(false);
+    }
+  }
+
   public async speak(text: string, lang: 'en' | 'hi' | 'auto' = 'auto', gender: 'male' | 'female' = this.voiceGender, rate = this.voiceRate, pitch = this.voicePitch): Promise<void> {
     if (typeof window === 'undefined' || !('speechSynthesis' in window)) {
       this.onError?.('Speech synthesis is not supported by this browser.');
@@ -257,30 +244,43 @@ export class VoiceEngine {
 
     const synth = window.speechSynthesis;
     const generation = ++this.speechGeneration;
-    this.stopListening();
+    this.stopListening(false);
     synth.cancel();
     try { synth.resume(); } catch (_) {}
 
-    const voices = await this.waitForVoices();
-    if (generation !== this.speechGeneration) return;
     const hasDevanagari = /[\u0900-\u097F]/.test(cleanText);
     const targetLang = lang === 'hi' || (lang === 'auto' && hasDevanagari) ? 'hi-IN' : 'en-US';
+    // Do not await voices here. On Chromium, delaying synth.speak() can lose the
+    // transient user activation from the button click. The browser's default
+    // voice is a safe fallback while voices are still loading.
+    const voices = synth.getVoices();
     const voice = this.selectVoice(voices, targetLang, gender);
     const chunks = this.splitSpeech(cleanText);
     if (!chunks.length) return;
 
     this.isSpeaking = true;
     this.onSpeakingChange?.(true);
+
+    const watchdogMs = Math.min(60_000, Math.max(8_000, cleanText.length * 180));
+    this.speechWatchdogTimer = window.setTimeout(() => {
+      if (generation !== this.speechGeneration) return;
+      synth.cancel();
+      this.finishSpeaking();
+    }, watchdogMs);
+
     try {
-      for (const chunk of chunks) {
+      // Schedule the first utterance immediately from the click-driven call stack.
+      for (let index = 0; index < chunks.length; index++) {
         if (generation !== this.speechGeneration) break;
+        const chunk = chunks[index];
         await new Promise<void>((resolve) => {
           const utterance = new SpeechSynthesisUtterance(chunk);
           utterance.lang = targetLang;
           utterance.rate = Math.min(2, Math.max(0.5, rate));
-          utterance.pitch = Math.min(2, Math.max(0, pitch));
+          utterance.pitch = Math.min(2, Math.max(0.5, pitch));
           utterance.volume = Math.min(1, Math.max(0, this.voiceVolume));
           if (voice) utterance.voice = voice;
+
           let settled = false;
           const finish = () => {
             if (settled) return;
@@ -288,23 +288,26 @@ export class VoiceEngine {
             resolve();
           };
           utterance.onend = finish;
-          utterance.onerror = finish;
+          utterance.onerror = (event: any) => {
+            if (event?.error && event.error !== 'canceled' && event.error !== 'interrupted') {
+              this.onError?.(`Speech playback error: ${event.error}`);
+            }
+            finish();
+          };
           try {
             synth.speak(utterance);
-            // Chrome can occasionally stall an utterance without firing onend.
+            // Some Chromium builds occasionally leave an utterance stuck in the queue.
             window.setTimeout(() => {
-              if (!synth.speaking) finish();
-            }, Math.max(3000, chunk.length * 120));
-          } catch (_) {
+              if (!synth.speaking && !synth.pending) finish();
+            }, Math.max(2500, chunk.length * 140));
+          } catch (error: any) {
+            this.onError?.(`Speech playback could not start: ${error?.message || 'unknown error'}`);
             finish();
           }
         });
       }
     } finally {
-      if (generation === this.speechGeneration) {
-        this.isSpeaking = false;
-        this.onSpeakingChange?.(false);
-      }
+      if (generation === this.speechGeneration) this.finishSpeaking();
     }
   }
 
@@ -315,10 +318,7 @@ export class VoiceEngine {
       synth.cancel();
       try { synth.resume(); } catch (_) {}
     }
-    if (this.isSpeaking) {
-      this.isSpeaking = false;
-      this.onSpeakingChange?.(false);
-    }
+    this.finishSpeaking();
   }
 
   public playChime(type: 'wake' | 'success' | 'execute' | 'error') {
