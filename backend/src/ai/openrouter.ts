@@ -1,42 +1,29 @@
-import { GoogleGenAI } from '@google/genai';
-import { JARVIS_TOOL_REGISTRY } from '../../../shared/tools';
-import { toolService } from '../services/toolService';
 import { db } from '../database/store';
 
-const OPENROUTER_TOOLS_SCHEMA = JARVIS_TOOL_REGISTRY.map((tool) => ({
-  type: 'function',
-  function: { name: tool.name, description: tool.description, parameters: tool.parameters },
-}));
+const OPENROUTER_MODEL = 'nvidia/nemotron-3.5-content-safety:free';
+const REQUEST_TIMEOUT_MS = 45_000;
+
+type ConversationMessage = { sender: 'user' | 'jarvis'; text: string };
 
 export interface OpenRouterRequestOptions {
   prompt: string;
-  conversationHistory?: Array<{ sender: 'user' | 'jarvis'; text: string }>;
+  conversationHistory?: ConversationMessage[];
   model?: string;
   apiKey?: string;
   language?: string;
 }
 
 export interface OpenRouterResponse {
-  source: 'openrouter' | 'gemini_fallback';
+  source: 'openrouter';
   model: string;
   text: string;
   hindiText?: string;
   toolCalls: Array<{ id: string; name: string; arguments: Record<string, any>; result?: any; timestamp: string }>;
 }
 
-const REQUEST_TIMEOUT_MS = 45_000;
-const GEMINI_TIMEOUT_MS = 30_000;
-
 export class OpenRouterService {
-  private defaultModel = 'openai/gpt-4o-mini';
-  private geminiFallbackModel = process.env.GEMINI_FALLBACK_MODEL || 'gemini-2.5-flash-lite';
-
   private getApiKey(overrideKey?: string): string {
     return (overrideKey || process.env.OPENROUTER_API_KEY || '').trim();
-  }
-
-  private getGeminiKey(): string {
-    return (process.env.GEMINI_API_KEY || '').trim();
   }
 
   private async request(body: Record<string, any>, apiKey: string, stream = false): Promise<Response> {
@@ -48,8 +35,8 @@ export class OpenRouterService {
         headers: {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${apiKey}`,
-          'HTTP-Referer': process.env.APP_URL || 'https://ai.studio',
-          'X-Title': 'JARVIS OpenRouter Assistant',
+          'HTTP-Referer': process.env.APP_URL || 'https://jarvis-private.onrender.com',
+          'X-Title': 'JARVIS NVIDIA Nemotron 3.5',
         },
         body: JSON.stringify({ ...body, stream }),
         signal: controller.signal,
@@ -59,188 +46,91 @@ export class OpenRouterService {
     }
   }
 
-  private async geminiFallback(options: OpenRouterRequestOptions, reason?: string): Promise<OpenRouterResponse> {
-    const apiKey = this.getGeminiKey();
-    const model = this.geminiFallbackModel;
+  public async sendMessage(options: OpenRouterRequestOptions): Promise<OpenRouterResponse> {
+    const apiKey = this.getApiKey(options.apiKey);
     if (!apiKey) {
-      const detail = reason ? ` OpenRouter fallback was triggered by: ${reason}.` : '';
       return {
-        source: 'gemini_fallback',
-        model,
-        text: `Sir, the primary OpenRouter connection is unavailable and no GEMINI_API_KEY is configured on the server.${detail}`,
-        hindiText: 'श्रीमान, OpenRouter connection उपलब्ध नहीं है और server पर GEMINI_API_KEY configured नहीं है।',
+        source: 'openrouter',
+        model: OPENROUTER_MODEL,
+        text: 'Sir, OPENROUTER_API_KEY is not configured on the server. Add your OpenRouter key in Render environment variables.',
+        hindiText: 'श्रीमान, server पर OPENROUTER_API_KEY configured नहीं है। Render environment variables में OpenRouter key जोड़ें।',
         toolCalls: [],
       };
     }
 
     const memoryContext = db.getMemories().map((m) => `- ${m.key}: ${m.value}`).join('\n');
-    const systemInstruction = `You are J.A.R.V.I.S., a fast personal AI assistant.
-Use concise, direct responses. Speak fluent English, Hindi, and natural Hinglish. Match the user's language.
-Do not claim a computer action happened unless a tool result confirms it.
-The cloud server cannot directly control the user's Windows desktop unless the Windows Local Agent is connected.
+    const systemPrompt = `You are J.A.R.V.I.S., the personal AI command assistant for the user.
+Use concise, direct, useful answers. Support English, Hindi, and natural Hinglish.
+Do not pretend to perform computer actions. Direct desktop actions are handled by JARVIS local command routing and the Windows companion agent.
+You are running through NVIDIA Nemotron 3.5 Content Safety on OpenRouter.
 Active memories:\n${memoryContext}`;
 
     const conversation = (options.conversationHistory || [])
       .slice(-4)
-      .map((m) => `${m.sender === 'user' ? 'User' : 'JARVIS'}: ${m.text}`)
-      .join('\n');
-    const prompt = `${conversation ? `${conversation}\n` : ''}User: ${options.prompt}`;
+      .map((m) => ({ role: m.sender === 'user' ? 'user' : 'assistant', content: m.text }));
 
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), GEMINI_TIMEOUT_MS);
-    try {
-      const ai = new GoogleGenAI({ apiKey });
-      const response = await ai.models.generateContent({
-        model,
-        contents: prompt,
-        config: {
-          systemInstruction,
-          temperature: 0.35,
-          maxOutputTokens: 700,
-        },
-      });
-      const text = response.text?.trim() || 'At your service, Sir.';
-      return {
-        source: 'gemini_fallback',
-        model,
-        text,
-        toolCalls: [],
-      };
-    } catch (error: any) {
-      const message = error?.message || 'Gemini fallback failed.';
-      throw new Error(`OpenRouter unavailable and Gemini fallback failed: ${message}`);
-    } finally {
-      clearTimeout(timer);
-    }
-  }
-
-  public async sendMessage(options: OpenRouterRequestOptions): Promise<OpenRouterResponse> {
-    const apiKey = this.getApiKey(options.apiKey);
-    const model = options.model || process.env.OPENROUTER_MODEL || this.defaultModel;
-
-    if (!apiKey) return this.geminiFallback(options, 'OPENROUTER_API_KEY is not configured');
-
-    const memoryContext = db.getMemories().map((m) => `- ${m.key}: ${m.value}`).join('\n');
-    const systemPrompt = `You are J.A.R.V.I.S., a fast personal AI desktop command center.
-Use concise, direct responses. Speak fluent English, Hindi, and natural Hinglish. Match the user's language.
-When the user asks you to take an action or research something, use the appropriate tool. Do not claim an action happened unless the tool result confirms it.
-The cloud server cannot directly control the user's Windows desktop unless the Windows Local Agent is connected; when a tool reports that limitation, explain it clearly.
-Active memories:\n${memoryContext}`;
-
-    const messages: any[] = [
+    const messages = [
       { role: 'system', content: systemPrompt },
-      ...(options.conversationHistory || []).slice(-4).map((m) => ({ role: m.sender === 'user' ? 'user' : 'assistant', content: m.text })),
-      { role: 'user', content: options.prompt },
+      ...conversation,
+      { role: 'user', content: options.prompt.trim() },
     ];
 
-    let response: Response;
-    try {
-      response = await this.request({
-        model,
-        messages,
-        tools: OPENROUTER_TOOLS_SCHEMA,
-        tool_choice: 'auto',
-        temperature: 0.35,
-        max_tokens: 700,
-      }, apiKey);
-    } catch (error: any) {
-      return this.geminiFallback(options, error?.message || 'network failure');
-    }
+    const response = await this.request({
+      model: OPENROUTER_MODEL,
+      messages,
+      temperature: 0.2,
+      max_tokens: 512,
+    }, apiKey);
 
     if (!response.ok) {
       const errorText = await response.text();
-      const reason = `OpenRouter HTTP ${response.status}`;
-      if (response.status === 401 || response.status === 402 || response.status === 403 || response.status === 429 || response.status >= 500) {
-        console.warn(`[AI] ${reason}; attempting Gemini fallback.`);
-        return this.geminiFallback(options, reason);
-      }
-      throw new Error(`OpenRouter Error (${response.status}): ${errorText}`);
+      throw new Error(`OpenRouter NVIDIA Error (${response.status}): ${errorText}`);
     }
 
     const data: any = await response.json();
-    const message = data.choices?.[0]?.message;
-    const executedToolCalls: any[] = [];
-
-    if (message?.tool_calls?.length) {
-      messages.push(message);
-      for (const tc of message.tool_calls) {
-        let parsedArgs: Record<string, any> = {};
-        try { parsedArgs = JSON.parse(tc.function.arguments || '{}'); } catch (_) {}
-
-        const toolResult = await toolService.execute({ tool: tc.function.name, arguments: parsedArgs, confirmed: false });
-        executedToolCalls.push({
-          id: tc.id || `tc_${Date.now()}`,
-          name: tc.function.name,
-          arguments: parsedArgs,
-          result: toolResult,
-          timestamp: new Date().toISOString(),
-        });
-        messages.push({ role: 'tool', tool_call_id: tc.id, content: JSON.stringify(toolResult) });
-      }
-
-      const followUp = await this.request({
-        model,
-        messages,
-        temperature: 0.35,
-        max_tokens: 700,
-      }, apiKey);
-
-      if (followUp.ok) {
-        const followData: any = await followUp.json();
-        const synthesizedText = followData.choices?.[0]?.message?.content;
-        if (synthesizedText) return { source: 'openrouter', model, text: synthesizedText, toolCalls: executedToolCalls };
-      }
-    }
+    const text = data.choices?.[0]?.message?.content?.trim() || 'At your service, Sir.';
 
     return {
       source: 'openrouter',
-      model,
-      text: message?.content || (executedToolCalls.length ? 'Action completed, Sir.' : 'At your service, Sir.'),
-      toolCalls: executedToolCalls,
+      model: OPENROUTER_MODEL,
+      text,
+      toolCalls: [],
     };
   }
 
   public async *streamResponse(options: OpenRouterRequestOptions): AsyncGenerator<string, void, unknown> {
     const apiKey = this.getApiKey(options.apiKey);
-    const model = options.model || process.env.OPENROUTER_MODEL || this.defaultModel;
     if (!apiKey) {
-      const fallback = await this.geminiFallback(options, 'OPENROUTER_API_KEY is not configured');
-      yield fallback.text;
+      yield 'Sir, OPENROUTER_API_KEY is not configured on the server.';
       return;
     }
 
-    let response: Response;
-    try {
-      response = await this.request({
-        model,
-        messages: [{ role: 'system', content: 'You are JARVIS. Be concise, direct, and helpful.' }, { role: 'user', content: options.prompt }],
-        temperature: 0.35,
-        max_tokens: 700,
-      }, apiKey, true);
-    } catch (error: any) {
-      const fallback = await this.geminiFallback(options, error?.message || 'network failure');
-      yield fallback.text;
-      return;
-    }
+    const response = await this.request({
+      model: OPENROUTER_MODEL,
+      messages: [
+        { role: 'system', content: 'You are JARVIS. Be concise, direct, safe, and helpful. Support English, Hindi, and Hinglish.' },
+        { role: 'user', content: options.prompt.trim() },
+      ],
+      temperature: 0.2,
+      max_tokens: 512,
+    }, apiKey, true);
 
     if (!response.ok || !response.body) {
-      if (response.status === 401 || response.status === 402 || response.status === 403 || response.status === 429 || response.status >= 500) {
-        const fallback = await this.geminiFallback(options, `OpenRouter HTTP ${response.status}`);
-        yield fallback.text;
-        return;
-      }
-      throw new Error(`OpenRouter stream failed: ${response.status} ${response.statusText}`);
+      const errorText = await response.text();
+      throw new Error(`OpenRouter NVIDIA stream error (${response.status}): ${errorText}`);
     }
 
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
+
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
       const lines = buffer.split('\n');
       buffer = lines.pop() || '';
+
       for (const line of lines) {
         const trimmed = line.trim();
         if (!trimmed || trimmed === 'data: [DONE]' || !trimmed.startsWith('data: ')) continue;
