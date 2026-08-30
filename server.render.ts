@@ -5,6 +5,7 @@ import os from 'os';
 import fs from 'fs';
 import dotenv from 'dotenv';
 import { openRouter } from './backend/src/ai/openrouter';
+import { commandRouter } from './backend/src/ai/router';
 import { toolService } from './backend/src/services/toolService';
 import { jarvisWs } from './backend/src/websocket/server';
 import { db } from './backend/src/database/store';
@@ -15,6 +16,7 @@ const app = express();
 const PORT = Number(process.env.PORT) || 3000;
 const DIST_DIR = path.resolve(process.cwd(), 'dist');
 const INDEX_FILE = path.join(DIST_DIR, 'index.html');
+const OPENROUTER_MODEL = 'nvidia/nemotron-3.5-content-safety:free';
 
 app.disable('x-powered-by');
 app.use(express.json({ limit: '25mb' }));
@@ -30,12 +32,17 @@ app.use(express.static(DIST_DIR, {
   },
 }));
 
-// Browsers often request this automatically. A successful empty response keeps
-// the console clean without inventing a frontend asset.
 app.get('/favicon.ico', (_req, res) => res.status(204).end());
 
 app.get('/api/health', (_req, res) => {
-  res.json({ status: 'online', aiProvider: 'openrouter', model: process.env.OPENROUTER_MODEL || 'openai/gpt-4o-mini', openRouterConfigured: Boolean(process.env.OPENROUTER_API_KEY), uptime: process.uptime(), timestamp: new Date().toISOString() });
+  res.json({
+    status: 'online',
+    aiProvider: 'openrouter',
+    model: OPENROUTER_MODEL,
+    openRouterConfigured: Boolean(process.env.OPENROUTER_API_KEY),
+    uptime: process.uptime(),
+    timestamp: new Date().toISOString(),
+  });
 });
 
 app.get('/api/system/metrics', (_req, res) => {
@@ -57,21 +64,52 @@ app.get('/api/system/metrics', (_req, res) => {
 
 app.post('/api/jarvis/process', async (req, res) => {
   try {
-    const { prompt, conversationHistory = [], language = 'auto', openRouterModel } = req.body || {};
+    const { prompt, conversationHistory = [], language = 'auto' } = req.body || {};
     if (typeof prompt !== 'string' || !prompt.trim()) return res.status(400).json({ error: 'Prompt string is required.' });
+
     const startedAt = Date.now();
+    const trimmedPrompt = prompt.trim();
+    const localDecision = commandRouter.route(trimmedPrompt);
+
+    // NVIDIA Nemotron 3.5 Content Safety is intentionally used as the only
+    // remote AI model. It does not provide OpenRouter tool/function calling,
+    // so predictable PC commands continue through the deterministic local
+    // command router before the model is contacted.
+    if (localDecision.isLocal && localDecision.tool) {
+      const toolResult = await toolService.execute({
+        tool: localDecision.tool,
+        arguments: localDecision.args || {},
+        confirmed: false,
+      });
+      const call = {
+        id: `local_${Date.now()}`,
+        name: localDecision.tool,
+        arguments: localDecision.args || {},
+        result: toolResult,
+        timestamp: new Date().toISOString(),
+      };
+      return res.json({
+        source: 'local_router',
+        model: OPENROUTER_MODEL,
+        text: localDecision.immediateReply || 'Action completed, Sir.',
+        hindiText: localDecision.hindiReply,
+        toolCalls: [call],
+        latencyMs: Date.now() - startedAt,
+      });
+    }
+
     const result = await openRouter.sendMessage({
-      prompt: prompt.trim(),
+      prompt: trimmedPrompt,
       conversationHistory: Array.isArray(conversationHistory) ? conversationHistory.slice(-4) : [],
-      model: openRouterModel || process.env.OPENROUTER_MODEL || 'openai/gpt-4o-mini',
+      model: OPENROUTER_MODEL,
       apiKey: process.env.OPENROUTER_API_KEY,
       language,
     });
-    return res.json({ ...result, source: 'openrouter', latencyMs: Date.now() - startedAt });
+    return res.json({ ...result, source: 'openrouter', model: OPENROUTER_MODEL, latencyMs: Date.now() - startedAt });
   } catch (error: any) {
     const message = error?.message || 'OpenRouter request failed.';
     console.error('[OpenRouter]', message);
-    return res.status(502).json({ error: message, source: 'openrouter', text: 'OpenRouter could not process that request. Check OPENROUTER_API_KEY, OPENROUTER_MODEL, and your OpenRouter account.' });
+    return res.status(502).json({ error: message, source: 'openrouter', model: OPENROUTER_MODEL, text: 'NVIDIA Nemotron could not process that request. Check OPENROUTER_API_KEY and OpenRouter model availability.' });
   }
 });
 
@@ -88,24 +126,23 @@ app.post('/api/tools/execute', async (req, res) => {
 
 app.post('/api/jarvis/analyze-screen', async (req, res) => {
   try {
-    const { imageBase64, prompt = 'Analyze this screenshot in detail.', openRouterModel } = req.body || {};
+    const { imageBase64, prompt = 'Analyze this screenshot in detail.' } = req.body || {};
     if (!imageBase64) return res.status(400).json({ error: 'imageBase64 is required.' });
     const apiKey = (process.env.OPENROUTER_API_KEY || '').trim();
     if (!apiKey) return res.status(503).json({ error: 'OPENROUTER_API_KEY is not configured.' });
     const cleanBase64 = String(imageBase64).replace(/^data:image\/[^;]+;base64,/, '');
     const dataUri = String(imageBase64).startsWith('data:') ? imageBase64 : `data:image/png;base64,${cleanBase64}`;
-    const model = openRouterModel || process.env.OPENROUTER_MODEL || 'openai/gpt-4o-mini';
     const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}`, 'HTTP-Referer': process.env.APP_URL || 'https://ai.studio', 'X-Title': 'JARVIS OpenRouter Vision' },
-      body: JSON.stringify({ model, messages: [{ role: 'user', content: [{ type: 'text', text: `You are JARVIS Vision. ${prompt}` }, { type: 'image_url', image_url: { url: dataUri } }] }], max_tokens: 900, temperature: 0.2 }),
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}`, 'HTTP-Referer': process.env.APP_URL || 'https://jarvis-private.onrender.com', 'X-Title': 'JARVIS NVIDIA Nemotron Vision' },
+      body: JSON.stringify({ model: OPENROUTER_MODEL, messages: [{ role: 'user', content: [{ type: 'text', text: `You are JARVIS Vision and safety analysis. ${prompt}` }, { type: 'image_url', image_url: { url: dataUri } }] }], max_tokens: 900, temperature: 0.2 }),
     });
     if (!response.ok) {
       const text = await response.text();
       return res.status(response.status).json({ error: `OpenRouter Vision Error (${response.status}): ${text}` });
     }
     const data: any = await response.json();
-    return res.json({ success: true, source: 'openrouter', model, analysis: data.choices?.[0]?.message?.content || 'No analysis returned.' });
+    return res.json({ success: true, source: 'openrouter', model: OPENROUTER_MODEL, analysis: data.choices?.[0]?.message?.content || 'No analysis returned.' });
   } catch (error: any) {
     return res.status(502).json({ error: error?.message || 'Vision request failed.' });
   }
@@ -114,24 +151,24 @@ app.post('/api/jarvis/analyze-screen', async (req, res) => {
 app.post('/api/openrouter/test', async (req, res) => {
   try {
     const apiKey = (process.env.OPENROUTER_API_KEY || req.body?.apiKey || '').trim();
-    const model = req.body?.model || process.env.OPENROUTER_MODEL || 'openai/gpt-4o-mini';
     if (!apiKey) return res.status(400).json({ success: false, error: 'OPENROUTER_API_KEY is not configured.' });
     const startedAt = Date.now();
     const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-      method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}`, 'HTTP-Referer': process.env.APP_URL || 'https://ai.studio', 'X-Title': 'JARVIS OpenRouter Connection Test' },
-      body: JSON.stringify({ model, messages: [{ role: 'user', content: 'Reply with exactly: JARVIS OpenRouter link operational.' }], max_tokens: 20, temperature: 0 }),
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}`, 'HTTP-Referer': process.env.APP_URL || 'https://jarvis-private.onrender.com', 'X-Title': 'JARVIS NVIDIA Nemotron Connection Test' },
+      body: JSON.stringify({ model: OPENROUTER_MODEL, messages: [{ role: 'user', content: 'Reply with exactly: JARVIS NVIDIA Nemotron link operational.' }], max_tokens: 24, temperature: 0 }),
     });
     const latencyMs = Date.now() - startedAt;
     const raw = await response.text();
     if (!response.ok) {
       let msg = `OpenRouter returned HTTP ${response.status}.`;
       try { msg = JSON.parse(raw)?.error?.message || msg; } catch (_) {}
-      return res.status(response.status).json({ success: false, latencyMs, error: msg, isCreditError: response.status === 402, isAuthError: response.status === 401 });
+      return res.status(response.status).json({ success: false, latencyMs, model: OPENROUTER_MODEL, error: msg, isCreditError: response.status === 402, isAuthError: response.status === 401 });
     }
     const data = JSON.parse(raw);
-    return res.json({ success: true, latencyMs, model, reply: data.choices?.[0]?.message?.content || 'JARVIS OpenRouter link operational.' });
+    return res.json({ success: true, latencyMs, model: OPENROUTER_MODEL, reply: data.choices?.[0]?.message?.content || 'JARVIS NVIDIA Nemotron link operational.' });
   } catch (error: any) {
-    return res.status(502).json({ success: false, error: error?.message || 'Connection test failed.' });
+    return res.status(502).json({ success: false, error: error?.message || 'Connection test failed.', model: OPENROUTER_MODEL });
   }
 });
 
@@ -192,5 +229,5 @@ jarvisWs.init(httpServer);
 httpServer.listen(PORT, '0.0.0.0', () => {
   console.log(`JARVIS OpenRouter backend listening on 0.0.0.0:${PORT}`);
   console.log(`Frontend dist: ${DIST_DIR}`);
-  console.log(`OpenRouter model: ${process.env.OPENROUTER_MODEL || 'openai/gpt-4o-mini'}`);
+  console.log(`OpenRouter model: ${OPENROUTER_MODEL}`);
 });
