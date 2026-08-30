@@ -89,8 +89,8 @@ export class VoiceEngine {
       }
       if (code === 'aborted' || code === 'no-speech') return;
 
-      // Permission/device failures are expected in some browsers or private
-      // windows. Keep JARVIS in standby instead of surfacing SYSTEM ERROR.
+      // Browser permission and device failures are handled as normal standby
+      // states. Do not write noisy console errors or turn JARVIS red.
       this.isListening = false;
       this.onStateChange?.(false);
       this.stopAudioVisualizer();
@@ -149,10 +149,10 @@ export class VoiceEngine {
     this.isListening = true;
     this.onStateChange?.(true);
 
-    // Audio visualization is optional. A denied microphone permission must not
-    // prevent SpeechRecognition from starting or generate console noise.
-    await this.initAudioVisualizer();
-    if (!this.isListening) return false;
+    // Do not request a second microphone stream just for visualization. The
+    // browser SpeechRecognition API requests microphone access itself; asking
+    // for getUserMedia here can cause NotAllowedError even when recognition works.
+    this.clearVisualizerState();
 
     try {
       this.recognitionStarting = true;
@@ -194,30 +194,15 @@ export class VoiceEngine {
     this.stopAudioVisualizer();
   }
 
-  private async initAudioVisualizer() {
-    if (typeof window === 'undefined' || !navigator.mediaDevices?.getUserMedia) return;
-    try {
-      if (!this.audioContext) {
-        const AudioContextCtor = window.AudioContext || (window as any).webkitAudioContext;
-        if (!AudioContextCtor) return;
-        this.audioContext = new AudioContextCtor();
-      }
-      if (this.audioContext.state === 'suspended') await this.audioContext.resume();
-      if (this.micStream) return;
+  private clearVisualizerState() {
+    this.stopAudioVisualizer();
+    this.analyser = null;
+    this.audioDataArray = null;
+  }
 
-      this.micStream = await navigator.mediaDevices.getUserMedia({
-        audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-        video: false,
-      });
-      const source = this.audioContext.createMediaStreamSource(this.micStream);
-      this.analyser = this.audioContext.createAnalyser();
-      this.analyser.fftSize = 64;
-      this.analyser.smoothingTimeConstant = 0.65;
-      source.connect(this.analyser);
-      this.audioDataArray = new Uint8Array(this.analyser.frequencyBinCount);
-    } catch (_) {
-      // Visualizer is enhancement-only. Speech recognition may still work.
-    }
+  private async initAudioVisualizer() {
+    // Kept for API compatibility with existing UI code. Visualizer input is
+    // intentionally disabled because SpeechRecognition already owns the mic.
   }
 
   private stopAudioVisualizer() {
