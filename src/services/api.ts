@@ -1,6 +1,9 @@
 import { SystemMetrics, MemoryItem, AutomationRoutine, AppSettings } from '../types';
 
-const FAST_AI_MODEL = 'nvidia/nemotron-3.5-content-safety:free';
+// Must be a model that supports the OpenAI-compatible `tools` interface.
+// Nemotron 3.5 Content Safety is a guardrail/classification model and does not
+// accept tools, so it cannot power JARVIS's agent loop.
+const FAST_AI_MODEL = 'minimax/minimax-m3:free';
 const REQUEST_TIMEOUT_MS = 45_000;
 
 async function fetchWithTimeout(input: RequestInfo | URL, init: RequestInit = {}, timeoutMs = REQUEST_TIMEOUT_MS) {
@@ -16,8 +19,8 @@ async function fetchWithTimeout(input: RequestInfo | URL, init: RequestInit = {}
 const normalizeSettings = (settings: Partial<AppSettings> = {}): AppSettings => ({
   ...settings,
   aiProvider: 'openrouter',
-  openRouterModel: FAST_AI_MODEL,
-  geminiModel: FAST_AI_MODEL,
+  openRouterModel: settings.openRouterModel || FAST_AI_MODEL,
+  geminiModel: settings.geminiModel || FAST_AI_MODEL,
 } as AppSettings);
 
 export const api = {
@@ -32,16 +35,17 @@ export const api = {
     return res.json();
   },
 
-  async processJarvisPrompt(prompt: string, conversationHistory: any[] = [], _settings?: Partial<AppSettings>, language = 'auto') {
+  async processJarvisPrompt(prompt: string, conversationHistory: any[] = [], settings?: Partial<AppSettings>, language = 'auto') {
     const normalizedPrompt = prompt.trim();
     if (!normalizedPrompt) throw new Error('Prompt cannot be empty.');
 
+    const model = settings?.openRouterModel || FAST_AI_MODEL;
     const payload = {
       prompt: normalizedPrompt,
-      conversationHistory: conversationHistory.slice(-4),
+      conversationHistory: conversationHistory.slice(-6),
       language,
       aiProvider: 'openrouter',
-      openRouterModel: FAST_AI_MODEL,
+      openRouterModel: model,
     };
 
     const startedAt = performance.now();
@@ -59,7 +63,7 @@ export const api = {
 
     if (!res.ok) {
       const err = await res.json().catch(() => ({ error: 'Unknown server error' }));
-      throw new Error(err.error || `NVIDIA OpenRouter server error (${res.status})`);
+      throw new Error(err.error || `OpenRouter server error (${res.status})`);
     }
 
     const data = await res.json();
@@ -78,11 +82,12 @@ export const api = {
     return res.json();
   },
 
-  async analyzeScreen(imageBase64: string, prompt?: string, _settings?: Partial<AppSettings>) {
+  async analyzeScreen(imageBase64: string, prompt?: string, settings?: Partial<AppSettings>) {
+    const model = settings?.openRouterModel || FAST_AI_MODEL;
     const res = await fetchWithTimeout('/api/jarvis/analyze-screen', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ imageBase64, prompt, openRouterModel: FAST_AI_MODEL }),
+      body: JSON.stringify({ imageBase64, prompt, openRouterModel: model }),
     }, 60_000);
     if (!res.ok) {
       const err = await res.json().catch(() => ({ error: 'Vision analysis failed' }));
@@ -91,9 +96,10 @@ export const api = {
     return res.json();
   },
 
-  async testOpenRouterKey(apiKey: string, _model = FAST_AI_MODEL) {
+  async testOpenRouterKey(apiKey: string, model = FAST_AI_MODEL) {
+    const selectedModel = model || FAST_AI_MODEL;
     const res = await fetchWithTimeout('/api/openrouter/test', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ apiKey, model: FAST_AI_MODEL }),
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ apiKey, model: selectedModel }),
     }, 20_000);
     const data = await res.json();
     if (!res.ok || !data.success) throw new Error(data.error || `HTTP ${res.status}: Failed to connect to OpenRouter`);
@@ -167,6 +173,6 @@ export const api = {
 
   async saveSettings(settings: AppSettings) {
     localStorage.setItem('jarvis_settings', JSON.stringify(normalizeSettings(settings)));
-    return { status: 'ok', model: FAST_AI_MODEL };
+    return { status: 'ok', model: settings.openRouterModel || FAST_AI_MODEL };
   },
 };
