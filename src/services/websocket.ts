@@ -27,6 +27,10 @@ export class JarvisWebSocketClient {
 
   constructor() {
     this.init();
+    // Native desktop control is an optional local capability, but it should
+    // be discovered automatically. The old code required another UI action
+    // to call enableAgent(), which meant the companion could never connect.
+    this.enableAgent();
   }
 
   public setAgentPort(port: number) {
@@ -126,7 +130,7 @@ export class JarvisWebSocketClient {
     try {
       const controller = new AbortController();
       const timeout = window.setTimeout(() => controller.abort(), 1200);
-      const response = await fetch(`http://127.0.0.1:${this.agentPort}/api/health`, {
+      const response = await fetch(`http://localhost:${this.agentPort}/api/health`, {
         method: 'GET',
         cache: 'no-store',
         signal: controller.signal,
@@ -157,7 +161,7 @@ export class JarvisWebSocketClient {
     if (this.agentWs && (this.agentWs.readyState === WebSocket.OPEN || this.agentWs.readyState === WebSocket.CONNECTING)) return;
 
     try {
-      const ws = new WebSocket(`ws://127.0.0.1:${this.agentPort}/ws`);
+      const ws = new WebSocket(`ws://localhost:${this.agentPort}/ws`);
       this.agentWs = ws;
 
       ws.onopen = () => {
@@ -352,10 +356,6 @@ export class JarvisWebSocketClient {
       if (this.backendWs?.readyState === WebSocket.OPEN) this.backendWs.send(JSON.stringify(resultMsg));
       this.notifyMessage(resultMsg);
 
-      // If Chrome blocks a background popup, a final search task can still be
-      // completed by navigating the current tab after the backend has received
-      // the successful tool result. We only do this for search_web so an
-      // intermediate open_url call cannot destroy the JARVIS session mid-task.
       if (tool === 'search_web' && browserFallback.popupBlocked && browserFallback.url) {
         window.setTimeout(() => {
           try { window.location.assign(browserFallback.url); } catch (_) {}
