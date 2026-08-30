@@ -156,8 +156,7 @@ export class JarvisWebSocketClient {
     if (this.agentWs && (this.agentWs.readyState === WebSocket.OPEN || this.agentWs.readyState === WebSocket.CONNECTING)) return;
 
     try {
-      const agentUrl = `ws://127.0.0.1:${this.agentPort}/ws`;
-      const ws = new WebSocket(agentUrl);
+      const ws = new WebSocket(`ws://127.0.0.1:${this.agentPort}/ws`);
       this.agentWs = ws;
 
       ws.onopen = () => {
@@ -189,14 +188,13 @@ export class JarvisWebSocketClient {
       };
 
       ws.onerror = () => {
-        // Do not generate noisy UI/console errors when the optional companion
-        // disappears; the next health probe will discover it again.
         if (this.agentWs === ws) this.agentWs = null;
         if (this.agentConnected) {
           this.agentConnected = false;
           this.notifyStatus(false, 'agent');
           this.sendAgentStatusToBackend(false);
         }
+        this.scheduleAgentProbe();
       };
     } catch (_) {
       this.agentWs = null;
@@ -268,22 +266,104 @@ export class JarvisWebSocketClient {
     else pending.resolve(msg.payload || {});
   }
 
+  private browserUrlForTool(tool: string, args: Record<string, any>) {
+    if (tool === 'open_url') {
+      const raw = String(args.url || '').trim();
+      return raw ? (/^https?:\/\//i.test(raw) ? raw : `https://${raw}`) : null;
+    }
+    if (tool === 'search_web') {
+      const q = String(args.query || '').trim();
+      if (!q) return null;
+      const engine = String(args.engine || 'google').toLowerCase();
+      const encoded = encodeURIComponent(q);
+      if (engine === 'youtube') return `https://www.youtube.com/results?search_query=${encoded}`;
+      if (engine === 'github') return `https://github.com/search?q=${encoded}`;
+      if (engine === 'wikipedia') return `https://en.wikipedia.org/wiki/Special:Search?search=${encoded}`;
+      return `https://www.google.com/search?q=${encoded}`;
+    }
+    return null;
+  }
+
+  private tryBrowserFallback(tool: string, args: Record<string, any>) {
+    if (typeof window === 'undefined') return null;
+
+    if (tool === 'open_application') {
+      const app = String(args.application || args.appName || '').trim().toLowerCase();
+      if (['chrome', 'google chrome', 'browser', 'edge', 'microsoft edge', 'msedge'].includes(app)) {
+        return {
+          success: true,
+          action: 'open_application',
+          application: app,
+          message: 'Browser session is already active. Continuing with browser actions without the Windows companion.',
+          browserFallback: true,
+          nativeAgentRequired: false,
+        };
+      }
+      return null;
+    }
+
+    const url = this.browserUrlForTool(tool, args);
+    if (!url) return null;
+
+    try {
+      const newWindow = window.open(url, '_blank', 'noopener,noreferrer');
+      return {
+        success: true,
+        action: tool,
+        url,
+        message: newWindow
+          ? `Opened ${url} in a new browser tab.`
+          : `Prepared ${url}. Chrome blocked the new tab; the URL is available in the tool result.`,
+        browserFallback: true,
+        popupBlocked: !newWindow,
+      };
+    } catch (_) {
+      return {
+        success: true,
+        action: tool,
+        url,
+        message: `Prepared ${url} for browser navigation.`,
+        browserFallback: true,
+        popupBlocked: true,
+      };
+    }
+  }
+
   private forwardBackendToolToAgent(msg: WebSocketMessage) {
+    const tool = String(msg.payload?.tool || '');
+    const args = (msg.payload?.arguments || {}) as Record<string, any>;
+
+    const browserFallback = this.tryBrowserFallback(tool, args);
+    if (browserFallback) {
+      const resultMsg: WebSocketMessage = {
+        type: 'tool_result',
+        requestId: msg.requestId,
+        timestamp: new Date().toISOString(),
+        payload: { tool, ...browserFallback },
+      };
+      if (this.backendWs?.readyState === WebSocket.OPEN) this.backendWs.send(JSON.stringify(resultMsg));
+      this.notifyMessage(resultMsg);
+      return;
+    }
+
     if (this.agentWs?.readyState === WebSocket.OPEN) {
       this.agentWs.send(JSON.stringify(msg));
       return;
     }
+
     const error: WebSocketMessage = {
       type: 'tool_result',
       requestId: msg.requestId,
       timestamp: new Date().toISOString(),
       payload: {
-        tool: msg.payload?.tool,
+        tool,
         success: false,
-        error: 'Windows Local Agent is offline. Start the JARVIS Windows agent to execute desktop actions.',
+        error: `Windows Local Agent is offline. Native desktop control for '${tool}' requires the JARVIS Windows companion. Browser-only actions remain available.`,
+        requiresWindowsAgent: true,
       },
     };
     if (this.backendWs?.readyState === WebSocket.OPEN) this.backendWs.send(JSON.stringify(error));
+    this.notifyMessage(error);
   }
 
   private sendAgentStatusToBackend(connected: boolean) {
