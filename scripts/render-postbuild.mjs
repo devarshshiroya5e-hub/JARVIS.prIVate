@@ -22,19 +22,20 @@ for (const [from, to] of portReplacements) {
   }
 }
 
-// Low-latency production model defaults. These are stable/current Gemini models
-// and are selected automatically when the server's Gemini fallback is used.
-output = output.replaceAll('gemini-3.7-flash', 'gemini-2.5-flash-lite');
-output = output.replaceAll('openai/gpt-4o', 'google/gemini-2.5-flash');
-output = output.replaceAll('openai/gpt-4o-mini', 'google/gemini-2.5-flash-lite');
-
-// Turn off extended thinking on Gemini 2.5 Flash paths used for quick assistant commands.
-output = output.replaceAll(
-  'temperature: 0.7,\n          tools: [{ functionDeclarations: JARVIS_TOOLS }],',
-  'temperature: 0.2,\n      thinkingConfig: { thinkingBudget: 0 },\n          tools: [{ functionDeclarations: JARVIS_TOOLS }],'
-);
-
-output = output.replaceAll('temperature: 0.7,\n        },', 'temperature: 0.2,\n          thinkingConfig: { thinkingBudget: 0 },\n        },');
+// JARVIS uses exactly one remote AI model in production.
+// Keep a defensive replacement here so stale bundled defaults cannot restore
+// Gemini/OpenAI model identifiers after a build.
+const NVIDIA_MODEL = 'nvidia/nemotron-3.5-content-safety:free';
+const legacyModels = [
+  'gemini-3.7-flash',
+  'gemini-2.5-flash-lite',
+  'gemini-2.5-flash',
+  'google/gemini-2.5-flash-lite',
+  'google/gemini-2.5-flash',
+  'openai/gpt-4o-mini',
+  'openai/gpt-4o',
+];
+for (const legacyModel of legacyModels) output = output.replaceAll(legacyModel, NVIDIA_MODEL);
 
 fs.writeFileSync(serverFile, output);
-console.log('Render postbuild complete: dist/server.cjs ready with Render PORT and low-latency AI defaults.');
+console.log(`Render postbuild complete: ${serverFile} configured for ${NVIDIA_MODEL}.`);
