@@ -1,3 +1,4 @@
+import { GoogleGenAI } from '@google/genai';
 import { JARVIS_TOOL_REGISTRY } from '../../../shared/tools';
 import { toolService } from '../services/toolService';
 import { db } from '../database/store';
@@ -16,7 +17,7 @@ export interface OpenRouterRequestOptions {
 }
 
 export interface OpenRouterResponse {
-  source: 'openrouter';
+  source: 'openrouter' | 'gemini_fallback';
   model: string;
   text: string;
   hindiText?: string;
@@ -24,12 +25,18 @@ export interface OpenRouterResponse {
 }
 
 const REQUEST_TIMEOUT_MS = 45_000;
+const GEMINI_TIMEOUT_MS = 30_000;
 
 export class OpenRouterService {
   private defaultModel = 'openai/gpt-4o-mini';
+  private geminiFallbackModel = process.env.GEMINI_FALLBACK_MODEL || 'gemini-2.5-flash-lite';
 
   private getApiKey(overrideKey?: string): string {
     return (overrideKey || process.env.OPENROUTER_API_KEY || '').trim();
+  }
+
+  private getGeminiKey(): string {
+    return (process.env.GEMINI_API_KEY || '').trim();
   }
 
   private async request(body: Record<string, any>, apiKey: string, stream = false): Promise<Response> {
@@ -52,20 +59,68 @@ export class OpenRouterService {
     }
   }
 
-  public async sendMessage(options: OpenRouterRequestOptions): Promise<OpenRouterResponse> {
-    const apiKey = this.getApiKey(options.apiKey);
-    const model = options.model || process.env.OPENROUTER_MODEL || this.defaultModel;
-
+  private async geminiFallback(options: OpenRouterRequestOptions, reason?: string): Promise<OpenRouterResponse> {
+    const apiKey = this.getGeminiKey();
+    const model = this.geminiFallbackModel;
     if (!apiKey) {
+      const detail = reason ? ` OpenRouter fallback was triggered by: ${reason}.` : '';
       return {
-        source: 'openrouter', model,
-        text: 'Sir, the OpenRouter neural link is ready but OPENROUTER_API_KEY is not configured on the server.',
-        hindiText: 'श्रीमान, OpenRouter neural link तैयार है, लेकिन server पर OPENROUTER_API_KEY configured नहीं है।',
+        source: 'gemini_fallback',
+        model,
+        text: `Sir, the primary OpenRouter connection is unavailable and no GEMINI_API_KEY is configured on the server.${detail}`,
+        hindiText: 'श्रीमान, OpenRouter connection उपलब्ध नहीं है और server पर GEMINI_API_KEY configured नहीं है।',
         toolCalls: [],
       };
     }
 
-    const memoryContext = db.getMemories().map(m => `- ${m.key}: ${m.value}`).join('\n');
+    const memoryContext = db.getMemories().map((m) => `- ${m.key}: ${m.value}`).join('\n');
+    const systemInstruction = `You are J.A.R.V.I.S., a fast personal AI assistant.
+Use concise, direct responses. Speak fluent English, Hindi, and natural Hinglish. Match the user's language.
+Do not claim a computer action happened unless a tool result confirms it.
+The cloud server cannot directly control the user's Windows desktop unless the Windows Local Agent is connected.
+Active memories:\n${memoryContext}`;
+
+    const conversation = (options.conversationHistory || [])
+      .slice(-4)
+      .map((m) => `${m.sender === 'user' ? 'User' : 'JARVIS'}: ${m.text}`)
+      .join('\n');
+    const prompt = `${conversation ? `${conversation}\n` : ''}User: ${options.prompt}`;
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), GEMINI_TIMEOUT_MS);
+    try {
+      const ai = new GoogleGenAI({ apiKey });
+      const response = await ai.models.generateContent({
+        model,
+        contents: prompt,
+        config: {
+          systemInstruction,
+          temperature: 0.35,
+          maxOutputTokens: 700,
+        },
+      });
+      const text = response.text?.trim() || 'At your service, Sir.';
+      return {
+        source: 'gemini_fallback',
+        model,
+        text,
+        toolCalls: [],
+      };
+    } catch (error: any) {
+      const message = error?.message || 'Gemini fallback failed.';
+      throw new Error(`OpenRouter unavailable and Gemini fallback failed: ${message}`);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  public async sendMessage(options: OpenRouterRequestOptions): Promise<OpenRouterResponse> {
+    const apiKey = this.getApiKey(options.apiKey);
+    const model = options.model || process.env.OPENROUTER_MODEL || this.defaultModel;
+
+    if (!apiKey) return this.geminiFallback(options, 'OPENROUTER_API_KEY is not configured');
+
+    const memoryContext = db.getMemories().map((m) => `- ${m.key}: ${m.value}`).join('\n');
     const systemPrompt = `You are J.A.R.V.I.S., a fast personal AI desktop command center.
 Use concise, direct responses. Speak fluent English, Hindi, and natural Hinglish. Match the user's language.
 When the user asks you to take an action or research something, use the appropriate tool. Do not claim an action happened unless the tool result confirms it.
@@ -78,17 +133,27 @@ Active memories:\n${memoryContext}`;
       { role: 'user', content: options.prompt },
     ];
 
-    const response = await this.request({
-      model,
-      messages,
-      tools: OPENROUTER_TOOLS_SCHEMA,
-      tool_choice: 'auto',
-      temperature: 0.35,
-      max_tokens: 700,
-    }, apiKey);
+    let response: Response;
+    try {
+      response = await this.request({
+        model,
+        messages,
+        tools: OPENROUTER_TOOLS_SCHEMA,
+        tool_choice: 'auto',
+        temperature: 0.35,
+        max_tokens: 700,
+      }, apiKey);
+    } catch (error: any) {
+      return this.geminiFallback(options, error?.message || 'network failure');
+    }
 
     if (!response.ok) {
       const errorText = await response.text();
+      const reason = `OpenRouter HTTP ${response.status}`;
+      if (response.status === 401 || response.status === 402 || response.status === 403 || response.status === 429 || response.status >= 500) {
+        console.warn(`[AI] ${reason}; attempting Gemini fallback.`);
+        return this.geminiFallback(options, reason);
+      }
       throw new Error(`OpenRouter Error (${response.status}): ${errorText}`);
     }
 
@@ -139,18 +204,33 @@ Active memories:\n${memoryContext}`;
     const apiKey = this.getApiKey(options.apiKey);
     const model = options.model || process.env.OPENROUTER_MODEL || this.defaultModel;
     if (!apiKey) {
-      yield 'Sir, OPENROUTER_API_KEY is not configured.';
+      const fallback = await this.geminiFallback(options, 'OPENROUTER_API_KEY is not configured');
+      yield fallback.text;
       return;
     }
 
-    const response = await this.request({
-      model,
-      messages: [{ role: 'system', content: 'You are JARVIS. Be concise, direct, and helpful.' }, { role: 'user', content: options.prompt }],
-      temperature: 0.35,
-      max_tokens: 700,
-    }, apiKey, true);
+    let response: Response;
+    try {
+      response = await this.request({
+        model,
+        messages: [{ role: 'system', content: 'You are JARVIS. Be concise, direct, and helpful.' }, { role: 'user', content: options.prompt }],
+        temperature: 0.35,
+        max_tokens: 700,
+      }, apiKey, true);
+    } catch (error: any) {
+      const fallback = await this.geminiFallback(options, error?.message || 'network failure');
+      yield fallback.text;
+      return;
+    }
 
-    if (!response.ok || !response.body) throw new Error(`OpenRouter stream failed: ${response.status} ${response.statusText}`);
+    if (!response.ok || !response.body) {
+      if (response.status === 401 || response.status === 402 || response.status === 403 || response.status === 429 || response.status >= 500) {
+        const fallback = await this.geminiFallback(options, `OpenRouter HTTP ${response.status}`);
+        yield fallback.text;
+        return;
+      }
+      throw new Error(`OpenRouter stream failed: ${response.status} ${response.statusText}`);
+    }
 
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
