@@ -1,4 +1,4 @@
-import { WebSocketMessage, SystemMetrics } from '../../shared/types';
+import { WebSocketMessage } from '../../shared/types';
 
 type MessageHandler = (message: WebSocketMessage) => void;
 type StatusHandler = (connected: boolean, source: 'backend' | 'agent') => void;
@@ -8,11 +8,13 @@ export class JarvisWebSocketClient {
   private backendWs: WebSocket | null = null;
   private messageHandlers: Set<MessageHandler> = new Set();
   private statusHandlers: Set<StatusHandler> = new Set();
-  private agentPort: number = 8765;
-  private reconnectTimeout: any = null;
-  private agentConnected: boolean = false;
-  private backendConnected: boolean = false;
-  private reconnectAttempts: number = 0;
+  private agentPort = 8765;
+  private reconnectTimeout: number | null = null;
+  private backendReconnectTimeout: number | null = null;
+  private agentConnected = false;
+  private backendConnected = false;
+  private reconnectAttempts = 0;
+  private agentEnabled = false;
 
   constructor() {
     this.init();
@@ -20,12 +22,31 @@ export class JarvisWebSocketClient {
 
   public setAgentPort(port: number) {
     this.agentPort = port;
-    this.reconnectAgent();
+    if (this.agentEnabled) this.reconnectAgent();
   }
 
   public init() {
     this.connectBackend();
-    this.connectAgent();
+    // The Windows bridge is optional. Do not open localhost:8765 on every
+    // page load when the companion agent is not installed/running.
+  }
+
+  public enableAgent() {
+    this.agentEnabled = true;
+    this.reconnectAttempts = 0;
+    this.reconnectAgent();
+  }
+
+  public disableAgent() {
+    this.agentEnabled = false;
+    if (this.reconnectTimeout !== null) window.clearTimeout(this.reconnectTimeout);
+    this.reconnectTimeout = null;
+    try { this.agentWs?.close(); } catch (_) {}
+    this.agentWs = null;
+    if (this.agentConnected) {
+      this.agentConnected = false;
+      this.notifyStatus(false, 'agent');
+    }
   }
 
   public onMessage(handler: MessageHandler) {
@@ -34,14 +55,13 @@ export class JarvisWebSocketClient {
   }
 
   public onStatusChange(handler: StatusHandler) {
-    this.statusHandlers.add(handler);
-    // Send immediate initial status
     handler(this.agentConnected, 'agent');
     handler(this.backendConnected, 'backend');
     return () => this.statusHandlers.delete(handler);
   }
 
   private connectBackend() {
+    if (this.backendWs && (this.backendWs.readyState === WebSocket.OPEN || this.backendWs.readyState === WebSocket.CONNECTING)) return;
     try {
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
       const wsUrl = `${protocol}//${window.location.host}/ws`;
@@ -53,16 +73,17 @@ export class JarvisWebSocketClient {
       };
 
       this.backendWs.onmessage = (event) => {
-        try {
-          const msg: WebSocketMessage = JSON.parse(event.data);
-          this.notifyMessage(msg);
-        } catch (_) {}
+        try { this.notifyMessage(JSON.parse(event.data) as WebSocketMessage); } catch (_) {}
       };
 
       this.backendWs.onclose = () => {
         this.backendConnected = false;
         this.notifyStatus(false, 'backend');
-        setTimeout(() => this.connectBackend(), 3000);
+        if (this.backendReconnectTimeout !== null) window.clearTimeout(this.backendReconnectTimeout);
+        this.backendReconnectTimeout = window.setTimeout(() => {
+          this.backendReconnectTimeout = null;
+          this.connectBackend();
+        }, 3000);
       };
 
       this.backendWs.onerror = () => {
@@ -76,54 +97,63 @@ export class JarvisWebSocketClient {
   }
 
   private connectAgent() {
+    if (!this.agentEnabled) return;
+    if (this.agentWs && (this.agentWs.readyState === WebSocket.OPEN || this.agentWs.readyState === WebSocket.CONNECTING)) return;
+
     try {
       const agentUrl = `ws://127.0.0.1:${this.agentPort}/ws`;
-      this.agentWs = new WebSocket(agentUrl);
+      const ws = new WebSocket(agentUrl);
+      this.agentWs = ws;
 
-      this.agentWs.onopen = () => {
+      ws.onopen = () => {
         this.agentConnected = true;
         this.reconnectAttempts = 0;
         this.notifyStatus(true, 'agent');
       };
 
-      this.agentWs.onmessage = (event) => {
-        try {
-          const msg: WebSocketMessage = JSON.parse(event.data);
-          this.notifyMessage(msg);
-        } catch (_) {}
+      ws.onmessage = (event) => {
+        try { this.notifyMessage(JSON.parse(event.data) as WebSocketMessage); } catch (_) {}
       };
 
-      this.agentWs.onclose = () => {
+      ws.onclose = () => {
+        if (this.agentWs === ws) this.agentWs = null;
+        const wasConnected = this.agentConnected;
         this.agentConnected = false;
-        this.notifyStatus(false, 'agent');
+        if (wasConnected) this.notifyStatus(false, 'agent');
         this.scheduleAgentReconnect();
       };
 
-      this.agentWs.onerror = () => {
-        this.agentConnected = false;
-        this.notifyStatus(false, 'agent');
+      // Deliberately do not log or surface localhost connection failures.
+      // The companion is optional and may simply be stopped/uninstalled.
+      ws.onerror = () => {
+        if (this.agentConnected) {
+          this.agentConnected = false;
+          this.notifyStatus(false, 'agent');
+        }
       };
     } catch (_) {
+      this.agentWs = null;
       this.agentConnected = false;
-      this.notifyStatus(false, 'agent');
       this.scheduleAgentReconnect();
     }
   }
 
   private scheduleAgentReconnect() {
-    if (this.reconnectTimeout) clearTimeout(this.reconnectTimeout);
-    // Exponential backoff capped at 8 seconds
-    const delay = Math.min(1000 * Math.pow(1.5, this.reconnectAttempts), 8000);
+    if (!this.agentEnabled || this.reconnectTimeout !== null) return;
+    const delay = Math.min(5000 * Math.pow(1.5, this.reconnectAttempts), 30000);
     this.reconnectAttempts++;
-    this.reconnectTimeout = setTimeout(() => {
+    this.reconnectTimeout = window.setTimeout(() => {
+      this.reconnectTimeout = null;
       this.connectAgent();
     }, delay);
   }
 
   public reconnectAgent() {
-    if (this.agentWs) {
-      try { this.agentWs.close(); } catch (_) {}
-    }
+    if (!this.agentEnabled) return;
+    if (this.reconnectTimeout !== null) window.clearTimeout(this.reconnectTimeout);
+    this.reconnectTimeout = null;
+    try { this.agentWs?.close(); } catch (_) {}
+    this.agentWs = null;
     this.connectAgent();
   }
 
@@ -132,42 +162,27 @@ export class JarvisWebSocketClient {
       type: message.type || 'execute_tool',
       requestId: message.requestId || `req_${Date.now()}`,
       timestamp: new Date().toISOString(),
-      payload: message.payload || {}
+      payload: message.payload || {},
     };
-
     const text = JSON.stringify(fullMsg);
 
-    // Prefer native Windows local agent connection if alive
-    if (this.agentWs && this.agentWs.readyState === WebSocket.OPEN) {
+    if (this.agentWs?.readyState === WebSocket.OPEN) {
       this.agentWs.send(text);
       return;
     }
-
-    // Fallback to backend WebSocket server
-    if (this.backendWs && this.backendWs.readyState === WebSocket.OPEN) {
-      this.backendWs.send(text);
-    }
+    if (this.backendWs?.readyState === WebSocket.OPEN) this.backendWs.send(text);
   }
 
   private notifyMessage(msg: WebSocketMessage) {
-    for (const handler of this.messageHandlers) {
-      handler(msg);
-    }
+    for (const handler of this.messageHandlers) handler(msg);
   }
 
   private notifyStatus(connected: boolean, source: 'backend' | 'agent') {
-    for (const handler of this.statusHandlers) {
-      handler(connected, source);
-    }
+    for (const handler of this.statusHandlers) handler(connected, source);
   }
 
-  public isAgentConnected() {
-    return this.agentConnected;
-  }
-
-  public isBackendConnected() {
-    return this.backendConnected;
-  }
+  public isAgentConnected() { return this.agentConnected; }
+  public isBackendConnected() { return this.backendConnected; }
 }
 
 export const wsClient = new JarvisWebSocketClient();
