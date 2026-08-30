@@ -9,3 +9,5 @@ services:
     envVars:
       - key: NODE_ENV
         value: production
+      - key: OPENROUTER_MODEL
+        value: openrouter/free
