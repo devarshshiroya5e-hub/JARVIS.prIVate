@@ -27,6 +27,7 @@ export interface WebSocketMessage<T = any> {
     | 'system_metrics'
     | 'agent_status'
     | 'voice_transcript'
+    | 'jarvis_response'
     | 'ai_stream_chunk'
     | 'ai_stream_end'
     | 'error'
