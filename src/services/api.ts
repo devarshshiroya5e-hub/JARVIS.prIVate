@@ -1,9 +1,9 @@
 import { SystemMetrics, MemoryItem, AutomationRoutine, AppSettings } from '../types';
+import { wsClient } from './websocket';
 
-// Must be a model that supports the OpenAI-compatible `tools` interface.
-// Nemotron 3.5 Content Safety is a guardrail/classification model and does not
-// accept tools, so it cannot power JARVIS's agent loop.
-const FAST_AI_MODEL = 'minimax/minimax-m3:free';
+// Current free OpenRouter model with multimodal input and tool calling.
+// See: https://openrouter.ai/minimax/minimax-m3:free
+export const FAST_AI_MODEL = 'minimax/minimax-m3:free';
 const REQUEST_TIMEOUT_MS = 45_000;
 
 async function fetchWithTimeout(input: RequestInfo | URL, init: RequestInit = {}, timeoutMs = REQUEST_TIMEOUT_MS) {
@@ -16,12 +16,33 @@ async function fetchWithTimeout(input: RequestInfo | URL, init: RequestInit = {}
   }
 }
 
+const normalizeModel = (model?: string) => {
+  const value = (model || '').trim();
+  if (!value || /content-safety|guardrail/i.test(value)) return FAST_AI_MODEL;
+  return value;
+};
+
 const normalizeSettings = (settings: Partial<AppSettings> = {}): AppSettings => ({
-  ...settings,
   aiProvider: 'openrouter',
-  openRouterModel: settings.openRouterModel || FAST_AI_MODEL,
+  openRouterApiKey: settings.openRouterApiKey || '',
+  openRouterModel: normalizeModel(settings.openRouterModel),
   geminiModel: settings.geminiModel || FAST_AI_MODEL,
-} as AppSettings);
+  agentHost: settings.agentHost,
+  agentPort: settings.agentPort || 8765,
+  language: settings.language || 'auto',
+  wakeWord: settings.wakeWord,
+  wakeWordEnabled: settings.wakeWordEnabled ?? true,
+  voiceGender: settings.voiceGender || 'male',
+  voicePitch: settings.voicePitch ?? 1,
+  voiceRate: settings.voiceRate ?? 1.05,
+  voiceVolume: settings.voiceVolume ?? 1,
+  pushToTalkKey: settings.pushToTalkKey,
+  soundEffectsEnabled: settings.soundEffectsEnabled ?? true,
+  autoSpeakResponses: settings.autoSpeakResponses ?? true,
+  safetyLevel: settings.safetyLevel || 'standard',
+  requireConfirmForDangerous: settings.requireConfirmForDangerous ?? true,
+  appPaths: settings.appPaths || {},
+});
 
 export const api = {
   async getHealth() {
@@ -39,54 +60,37 @@ export const api = {
     const normalizedPrompt = prompt.trim();
     if (!normalizedPrompt) throw new Error('Prompt cannot be empty.');
 
-    const model = settings?.openRouterModel || FAST_AI_MODEL;
-    const payload = {
-      prompt: normalizedPrompt,
-      conversationHistory: conversationHistory.slice(-6),
+    const model = normalizeModel(settings?.openRouterModel);
+    return wsClient.processPrompt(
+      normalizedPrompt,
+      conversationHistory,
       language,
-      aiProvider: 'openrouter',
-      openRouterModel: model,
-      // Allow a key entered in the UI to actually power the request. The server
-      // still prefers its environment variable when no per-request key is sent.
-      openRouterApiKey: settings?.openRouterApiKey?.trim() || undefined,
-    };
-
-    const startedAt = performance.now();
-    let res: Response;
-    try {
-      res = await fetchWithTimeout('/api/jarvis/process', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-      });
-    } catch (error: any) {
-      if (error?.name === 'AbortError') throw new Error('JARVIS request timed out. Please try again.');
-      throw error;
-    }
-
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({ error: 'Unknown server error' }));
-      throw new Error(err.error || `OpenRouter server error (${res.status})`);
-    }
-
-    const data = await res.json();
-    data.clientLatencyMs = Math.round(performance.now() - startedAt);
-    return data;
+      settings?.openRouterApiKey?.trim() || '',
+      model,
+    );
   },
 
   async executeTool(toolName: string, args: Record<string, any> = {}) {
-    const res = await fetchWithTimeout('/api/tools/execute', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ toolName, args }),
-    }, 20_000);
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({ error: 'Tool execution failed' }));
-      throw new Error(err.error || 'Failed to execute tool');
-    }
-    return res.json();
+    return new Promise<any>((resolve, reject) => {
+      const requestId = `tool_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+      const timeoutId = window.setTimeout(() => reject(new Error(`Tool ${toolName} timed out.`)), 20_000);
+      const unsubscribe = wsClient.onMessage((msg) => {
+        if (msg.requestId !== requestId) return;
+        unsubscribe();
+        window.clearTimeout(timeoutId);
+        if (msg.type === 'tool_result') resolve(msg.payload);
+        else reject(new Error(msg.payload?.error || `Tool ${toolName} failed.`));
+      });
+      wsClient.send({
+        type: 'execute_tool',
+        requestId,
+        payload: { tool: toolName, arguments: args },
+      });
+    });
   },
 
   async analyzeScreen(imageBase64: string, prompt?: string, settings?: Partial<AppSettings>) {
-    const model = settings?.openRouterModel || FAST_AI_MODEL;
+    const model = normalizeModel(settings?.openRouterModel);
     const res = await fetchWithTimeout('/api/jarvis/analyze-screen', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -105,9 +109,11 @@ export const api = {
   },
 
   async testOpenRouterKey(apiKey: string, model = FAST_AI_MODEL) {
-    const selectedModel = model || FAST_AI_MODEL;
+    const selectedModel = normalizeModel(model);
     const res = await fetchWithTimeout('/api/openrouter/test', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ apiKey, model: selectedModel }),
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ apiKey, model: selectedModel }),
     }, 20_000);
     const data = await res.json();
     if (!res.ok || !data.success) throw new Error(data.error || `HTTP ${res.status}: Failed to connect to OpenRouter`);
@@ -161,13 +167,8 @@ export const api = {
   },
 
   async getBridgeScript(): Promise<{ script: string; filename: string }> {
-    const res = await fetchWithTimeout('/api/windows-bridge/script?format=json');
-    if (!res.ok) throw new Error('Failed to get bridge script');
-    const contentType = res.headers.get('content-type') || '';
-    if (contentType.includes('application/json')) {
-      const data = await res.json();
-      return { script: data.script || '', filename: data.filename || 'jarvis_windows_bridge.py' };
-    }
+    const res = await fetchWithTimeout('/jarvis_windows_bridge.py');
+    if (!res.ok) throw new Error('Failed to get Windows agent script');
     return { script: await res.text(), filename: 'jarvis_windows_bridge.py' };
   },
 
@@ -180,7 +181,8 @@ export const api = {
   },
 
   async saveSettings(settings: AppSettings) {
-    localStorage.setItem('jarvis_settings', JSON.stringify(normalizeSettings(settings)));
-    return { status: 'ok', model: settings.openRouterModel || FAST_AI_MODEL };
+    const normalized = normalizeSettings(settings);
+    localStorage.setItem('jarvis_settings', JSON.stringify(normalized));
+    return { status: 'ok', model: normalized.openRouterModel };
   },
 };
