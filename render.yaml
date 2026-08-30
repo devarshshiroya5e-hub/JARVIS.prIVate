@@ -2,7 +2,7 @@ services:
   - type: web
     name: jarvis-private
     runtime: node
-    buildCommand: npm ci && npm run build
+    buildCommand: npm install && npm run build
     startCommand: npm start
     autoDeployTrigger: commit
     healthCheckPath: /api/health
