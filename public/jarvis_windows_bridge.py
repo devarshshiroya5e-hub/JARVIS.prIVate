@@ -1,24 +1,24 @@
 """
 JARVIS Windows Local Companion Bridge
 Run with Python 3.11+ on the Windows PC that is running the JARVIS web UI.
-This file is intentionally self-contained so the JARVIS download button works.
 
 Install:
     py -m pip install fastapi uvicorn pyautogui psutil pillow pydantic websockets
 Run:
     py jarvis_windows_bridge.py
 
-The browser connects to ws://127.0.0.1:8765/ws and sends desktop commands.
+The browser connects to http://localhost:8765 and ws://localhost:8765/ws.
+The bridge intentionally binds to loopback only; it is not a LAN server.
 """
 
 from __future__ import annotations
 
-import asyncio
 import ctypes
 import json
 import os
 import platform
 import subprocess
+import sys
 import time
 import webbrowser
 from pathlib import Path
@@ -36,14 +36,30 @@ try:
 except Exception:
     pyautogui = None
 
-app = FastAPI(title="JARVIS Windows Local Companion", version="4.0.0")
+DEFAULT_ALLOWED_ORIGINS = {
+    "https://jarvis-private-vg35.onrender.com",
+    "http://localhost:3000",
+    "http://localhost:5173",
+    "http://127.0.0.1:3000",
+    "http://127.0.0.1:5173",
+}
+
+
+def allowed_origins() -> set[str]:
+    configured = os.getenv("JARVIS_ALLOWED_ORIGINS", "")
+    origins = {item.strip().rstrip("/") for item in configured.split(",") if item.strip()}
+    return origins or DEFAULT_ALLOWED_ORIGINS
+
+
+app = FastAPI(title="JARVIS Windows Local Companion", version="4.1.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=sorted(allowed_origins()),
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["content-type"],
 )
+
 
 class ToolRequest(BaseModel):
     tool: str
@@ -59,7 +75,7 @@ def fail(message: str, **data: Any) -> dict:
 
 
 def open_application(application: str, args: str = "") -> dict:
-    app = (application or "").strip()
+    app_name = (application or "").strip()
     aliases = {
         "chrome": "chrome", "google chrome": "chrome",
         "code": "code", "vscode": "code", "vs code": "code",
@@ -71,17 +87,20 @@ def open_application(application: str, args: str = "") -> dict:
         "task manager": "taskmgr.exe", "taskmgr": "taskmgr.exe",
         "edge": "msedge", "microsoft edge": "msedge",
     }
-    target = aliases.get(app.lower(), app)
+    target = aliases.get(app_name.lower(), app_name)
     if not target:
         return fail("Application name is empty.")
     try:
         if platform.system() == "Windows":
-            subprocess.Popen(f'start "" "{target}" {args}'.strip(), shell=True)
+            command = f'start "" "{target}"'
+            if args:
+                command += f' {args}'
+            subprocess.Popen(command, shell=True)
         else:
             subprocess.Popen([target] + ([args] if args else []))
-        return ok(action="open_application", application=app, message=f"Successfully launched {app}.")
+        return ok(action="open_application", application=app_name, message=f"Successfully launched {app_name}.")
     except Exception as exc:
-        return fail(str(exc), action="open_application", application=app)
+        return fail(str(exc), action="open_application", application=app_name)
 
 
 def close_application(application: str) -> dict:
@@ -111,7 +130,7 @@ def get_metrics() -> dict:
         active_window = "JARVIS Desktop Command Center"
         if platform.system() == "Windows":
             try:
-                import win32gui  # optional pywin32
+                import win32gui
                 title = win32gui.GetWindowText(win32gui.GetForegroundWindow())
                 if title:
                     active_window = title
@@ -143,7 +162,7 @@ def execute_tool(tool: str, args: dict) -> dict:
         if tool == "close_application":
             return close_application(args.get("application") or args.get("processName", ""))
         if tool == "open_url":
-            url = args.get("url", "").strip()
+            url = str(args.get("url", "")).strip()
             if not url:
                 return fail("URL is empty.")
             if not url.startswith(("http://", "https://")):
@@ -151,7 +170,7 @@ def execute_tool(tool: str, args: dict) -> dict:
             webbrowser.open(url)
             return ok(action="open_url", url=url, message=f"Opened {url}.")
         if tool == "search_web":
-            q = args.get("query", "").strip()
+            q = str(args.get("query", "")).strip()
             engine = (args.get("engine") or "google").lower()
             from urllib.parse import quote_plus
             if engine == "youtube":
@@ -175,7 +194,7 @@ def execute_tool(tool: str, args: dict) -> dict:
             if pyautogui is None:
                 return fail("pyautogui is not installed.")
             key = str(args.get("key", "enter")).lower()
-            aliases = {"volumeup": "volumeup", "volumedown": "volumedown", "volumemute": "volumemute", "escape": "esc"}
+            aliases = {"escape": "esc"}
             pyautogui.press(aliases.get(key, key))
             return ok(action="press_key", key=key)
         if tool == "keyboard_shortcut":
@@ -217,7 +236,8 @@ def execute_tool(tool: str, args: dict) -> dict:
             return get_metrics()
         if tool == "list_files":
             directory = Path(args.get("directory") or str(Path.home()))
-            if not directory.exists(): return fail(f"Directory does not exist: {directory}")
+            if not directory.exists():
+                return fail(f"Directory does not exist: {directory}")
             items = []
             for item in list(directory.iterdir())[:100]:
                 try:
@@ -230,26 +250,31 @@ def execute_tool(tool: str, args: dict) -> dict:
             base = Path(args.get("directory") or str(Path.home()))
             query = str(args.get("query") or "").lower()
             recursive = bool(args.get("recursive", True))
-            if not base.exists(): return fail(f"Directory does not exist: {base}")
+            if not base.exists():
+                return fail(f"Directory does not exist: {base}")
             iterator = base.rglob("*") if recursive else base.glob("*")
             found = []
             for item in iterator:
-                if len(found) >= 50: break
+                if len(found) >= 50:
+                    break
                 if query in item.name.lower() or (query.startswith("*.") and item.suffix.lower() == query[1:]):
                     found.append({"name": item.name, "path": str(item), "isDirectory": item.is_dir()})
             return ok(query=query, directory=str(base), matches=found)
         if tool == "create_folder":
             path_value = args.get("path") or args.get("folderPath")
-            if not path_value: return fail("Folder path is empty.")
+            if not path_value:
+                return fail("Folder path is empty.")
             Path(path_value).mkdir(parents=True, exist_ok=True)
             return ok(path=str(Path(path_value).resolve()))
         if tool == "create_file":
             path_value = args.get("path") or args.get("filePath")
-            if not path_value: return fail("File path is empty.")
+            if not path_value:
+                return fail("File path is empty.")
             target = Path(path_value)
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(str(args.get("content", "")), encoding="utf-8")
-            return ok(path=str(target.resolve()), bytesWritten=len(str(args.get("content", "")).encode("utf-8")))
+            content = str(args.get("content", ""))
+            target.write_text(content, encoding="utf-8")
+            return ok(path=str(target.resolve()), bytesWritten=len(content.encode("utf-8")))
         if tool == "lock_pc":
             if platform.system() == "Windows":
                 ctypes.windll.user32.LockWorkStation()
@@ -261,7 +286,32 @@ def execute_tool(tool: str, args: dict) -> dict:
 
 @app.get("/api/health")
 async def health() -> dict:
-    return {"status": "ok", "agent": "JARVIS Windows Local Companion", "version": "4.0.0"}
+    return {
+        "status": "ok",
+        "agent": "JARVIS Windows Local Companion",
+        "version": "4.1.0",
+        "platform": platform.system(),
+        "python": platform.python_version(),
+        "pyautogui": pyautogui is not None,
+    }
+
+
+@app.get("/api/diagnostics")
+async def diagnostics() -> dict:
+    return ok(
+        health="ok",
+        platform=platform.platform(),
+        python=platform.python_version(),
+        executable=sys.executable,
+        user=os.getenv("USERNAME") or os.getenv("USER") or "unknown",
+        interactiveDesktop=platform.system() != "Windows" or bool(os.getenv("SESSIONNAME")),
+        pyautoguiInstalled=pyautogui is not None,
+        workingDirectory=str(Path.cwd()),
+        allowedOrigins=sorted(allowed_origins()),
+        listenHost="127.0.0.1",
+        listenPort=8765,
+        note="Native input requires the logged-in interactive Windows desktop. Elevated apps may require a matching privilege level.",
+    )
 
 
 @app.get("/api/metrics")
@@ -276,12 +326,17 @@ async def api_execute(req: ToolRequest) -> dict:
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
+    origin = websocket.headers.get("origin", "").rstrip("/")
+    if origin and origin not in allowed_origins():
+        await websocket.close(code=1008, reason="Origin not allowed")
+        return
+
     await websocket.accept()
     await websocket.send_text(json.dumps({
         "type": "agent_status",
         "requestId": f"agent_init_{int(time.time()*1000)}",
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "payload": {"status": "connected", "agentConnected": True, "version": "4.0.0"},
+        "payload": {"status": "connected", "agentConnected": True, "version": "4.1.0"},
     }))
     try:
         while True:
@@ -309,7 +364,8 @@ async def websocket_endpoint(websocket: WebSocket):
 
 
 if __name__ == "__main__":
-    print("J.A.R.V.I.S. Windows Local Companion v4.0.0")
-    print("WebSocket: ws://127.0.0.1:8765/ws")
-    print("HTTP:      http://127.0.0.1:8765/api/health")
+    print("J.A.R.V.I.S. Windows Local Companion v4.1.0")
+    print("HTTP:      http://localhost:8765/api/health")
+    print("WebSocket: ws://localhost:8765/ws")
+    print("Native desktop control is local-only and runs as the current Windows user.")
     uvicorn.run(app, host="127.0.0.1", port=8765, log_level="info")
