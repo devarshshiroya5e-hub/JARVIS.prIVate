@@ -285,6 +285,26 @@ export class JarvisWebSocketClient {
     return null;
   }
 
+  private openBrowserUrl(url: string) {
+    try {
+      if (this.browserFallbackWindow && !this.browserFallbackWindow.closed) {
+        this.browserFallbackWindow.location.href = url;
+        return { opened: true, reused: true };
+      }
+
+      // Avoid rel=noopener here because Chromium may return null for a newly
+      // opened window, preventing us from reusing it for subsequent tool calls.
+      const opened = window.open(url, '_blank');
+      if (opened) {
+        try { opened.opener = null; } catch (_) {}
+        this.browserFallbackWindow = opened;
+      }
+      return { opened: !!opened, reused: false };
+    } catch (_) {
+      return { opened: false, reused: false };
+    }
+  }
+
   private tryBrowserFallback(tool: string, args: Record<string, any>) {
     if (typeof window === 'undefined') return null;
 
@@ -306,46 +326,24 @@ export class JarvisWebSocketClient {
     const url = this.browserUrlForTool(tool, args);
     if (!url) return null;
 
-    try {
-      let opened = false;
-      let reused = false;
-      if (this.browserFallbackWindow && !this.browserFallbackWindow.closed) {
-        this.browserFallbackWindow.location.href = url;
-        opened = true;
-        reused = true;
-      } else {
-        const newWindow = window.open(url, '_blank', 'noopener,noreferrer');
-        if (newWindow) {
-          this.browserFallbackWindow = newWindow;
-          opened = true;
-        }
-      }
-      return {
-        success: opened,
-        action: tool,
-        url,
-        message: opened
-          ? `${reused ? 'Navigated' : 'Opened'} ${url} in the JARVIS browser session.`
-          : `Chrome blocked the new browser tab. Target URL: ${url}`,
-        browserFallback: true,
-        popupBlocked: !opened,
-      };
-    } catch (_) {
-      return {
-        success: false,
-        action: tool,
-        url,
-        message: `Unable to open the browser tab. Target URL: ${url}`,
-        browserFallback: true,
-        popupBlocked: true,
-      };
-    }
+    const result = this.openBrowserUrl(url);
+    return {
+      success: result.opened,
+      action: tool,
+      url,
+      message: result.opened
+        ? `${result.reused ? 'Navigated' : 'Opened'} ${url} in the JARVIS browser session.`
+        : `Chrome blocked the new tab. Target URL: ${url}`,
+      browserFallback: true,
+      popupBlocked: !result.opened,
+    };
   }
 
   private forwardBackendToolToAgent(msg: WebSocketMessage) {
     const tool = String(msg.payload?.tool || '');
     const args = (msg.payload?.arguments || {}) as Record<string, any>;
 
+    // Web-only browser actions work even without the Windows companion.
     const browserFallback = this.tryBrowserFallback(tool, args);
     if (browserFallback) {
       const resultMsg: WebSocketMessage = {
