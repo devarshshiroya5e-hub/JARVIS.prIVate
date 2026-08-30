@@ -33,7 +33,6 @@ import { voiceEngine } from './services/voice';
 import { wsClient } from './services/websocket';
 
 export function App() {
-  // Application State
   const [status, setStatus] = useState<JarvisStatus>('IDLE');
   const [activeTab, setActiveTab] = useState<TabType>('home');
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
@@ -44,7 +43,6 @@ export function App() {
   const [isBooting, setIsBooting] = useState(true);
   const [isLoadingPrompt, setIsLoadingPrompt] = useState(false);
 
-  // Modals
   const [bridgeModalOpen, setBridgeModalOpen] = useState(false);
   const [safetyModal, setSafetyModal] = useState<{
     isOpen: boolean;
@@ -58,21 +56,21 @@ export function App() {
     warningText: '',
   });
 
-  // Settings
+  // Fast built-in Gemini route is the default. OpenRouter remains available in Settings.
   const [settings, setSettings] = useState<AppSettings>({
-    aiProvider: 'openrouter',
-    geminiModel: 'gemini-2.5-flash',
+    aiProvider: 'gemini',
+    geminiModel: 'gemini-2.5-flash-lite',
     openRouterApiKey: '',
-    openRouterModel: 'openai/gpt-4o',
+    openRouterModel: 'google/gemini-2.5-flash-lite',
     language: 'auto',
     voiceGender: 'male',
-    voiceRate: 1.0,
+    voiceRate: 1.05,
     voicePitch: 1.0,
+    voiceVolume: 1.0,
     wakeWordEnabled: true,
     requireConfirmForDangerous: true,
   });
 
-  // Data Collections
   const [messages, setMessages] = useState<ChatMessage[]>([
     {
       id: '1',
@@ -100,7 +98,6 @@ export function App() {
   const [appPaths, setAppPaths] = useState<Record<string, string>>({});
   const [isExecutingRoutineId, setIsExecutingRoutineId] = useState<string | null>(null);
 
-  // Helper to add activity log
   const addLog = useCallback(
     (title: string, type: ActivityLogEntry['type'], status: ActivityLogEntry['status'] = 'success', detail?: string) => {
       setActivityLogs((prev) => [
@@ -118,13 +115,12 @@ export function App() {
     []
   );
 
-  // Load Initial Backend State & Telemetry
   const refreshMetrics = useCallback(async () => {
     try {
       const data = await api.getSystemMetrics();
       setSystemMetrics(data);
       setIsOnline(true);
-    } catch (e) {
+    } catch (_) {
       setIsOnline(false);
     }
   }, []);
@@ -150,15 +146,14 @@ export function App() {
     refreshMetrics();
     loadInitialData();
 
-    // Subscribe to WebSocket client events
     const unsubStatus = wsClient.onStatusChange((connected, source) => {
       if (source === 'agent') {
         setIsAgentConnected(connected);
-        if (connected) {
-          addLog('Windows Local Agent Connected (ws://127.0.0.1:8765)', 'system', 'success');
-        } else {
-          addLog('Windows Local Agent Disconnected', 'system', 'warning');
-        }
+        addLog(
+          connected ? 'Windows Local Agent Connected' : 'Windows Local Agent Disconnected',
+          'system',
+          connected ? 'success' : 'warning'
+        );
       } else if (source === 'backend') {
         setIsOnline(connected);
       }
@@ -169,11 +164,15 @@ export function App() {
         setSystemMetrics(msg.payload.metrics);
         setIsAgentConnected(true);
       } else if (msg.type === 'tool_result') {
-        addLog(`Agent Tool Result: ${msg.payload?.toolName || 'tool'}`, 'tool', msg.payload?.error ? 'error' : 'success', JSON.stringify(msg.payload?.result || msg.payload?.error));
+        addLog(
+          `Agent Tool Result: ${msg.payload?.toolName || 'tool'}`,
+          'tool',
+          msg.payload?.error ? 'error' : 'success',
+          JSON.stringify(msg.payload?.result || msg.payload?.error)
+        );
       }
     });
 
-    // Telemetry periodic polling
     const timer = setInterval(refreshMetrics, 4000);
     return () => {
       clearInterval(timer);
@@ -182,11 +181,10 @@ export function App() {
     };
   }, [refreshMetrics, loadInitialData, addLog]);
 
-  // Voice Engine setup
   useEffect(() => {
     voiceEngine.onResult = (transcript) => {
       addLog(`Voice Recognized: "${transcript}"`, 'voice', 'success');
-      handleProcessUserPrompt(transcript);
+      void handleProcessUserPrompt(transcript);
     };
 
     voiceEngine.onWakeWord = (word) => {
@@ -194,49 +192,59 @@ export function App() {
       setStatus('LISTENING');
     };
 
+    voiceEngine.onError = (message) => {
+      setIsListening(false);
+      setStatus('ERROR');
+      addLog(message, 'voice', 'error');
+      window.setTimeout(() => setStatus('IDLE'), 1500);
+    };
+
     voiceEngine.onStateChange = (listening) => {
       setIsListening(listening);
-      if (listening && status === 'IDLE') {
-        setStatus('LISTENING');
-      } else if (!listening && status === 'LISTENING') {
-        setStatus('IDLE');
-      }
+      if (listening) setStatus('LISTENING');
+      else if (!isLoadingPrompt) setStatus('IDLE');
     };
 
     return () => {
+      voiceEngine.onResult = undefined;
+      voiceEngine.onWakeWord = undefined;
+      voiceEngine.onError = undefined;
       voiceEngine.stopListening();
     };
-  }, [status, addLog]);
+  }, [addLog, isLoadingPrompt]);
 
-  // Toggle Mic
-  const handleToggleMic = () => {
+  const handleToggleMic = async () => {
     if (isListening) {
       voiceEngine.stopListening();
       setIsListening(false);
       setStatus('IDLE');
       addLog('Microphone Standby', 'voice', 'info');
-    } else {
-      voiceEngine.startListening(language);
+      return;
+    }
+
+    const started = await voiceEngine.startListening(language);
+    if (started) {
       setIsListening(true);
       setStatus('LISTENING');
-      addLog('Microphone Active (Listening)', 'voice', 'info');
+      addLog('Microphone Active — speak your command', 'voice', 'info');
+    } else {
+      setIsListening(false);
+      setStatus('IDLE');
     }
   };
 
-  // Toggle Language
   const handleToggleLanguage = () => {
     setLanguage((prev) => {
       const next = prev === 'auto' ? 'en' : prev === 'en' ? 'hi' : 'auto';
+      voiceEngine.setLanguage(next);
       addLog(`Language changed to: ${next.toUpperCase()}`, 'system', 'info');
       return next;
     });
   };
 
-  // Main Prompt Processor (AI + Tool Execution Engine)
   const handleProcessUserPrompt = async (text: string) => {
     if (!text.trim() || isLoadingPrompt) return;
 
-    // Add User message
     const userMsg: ChatMessage = {
       id: String(Date.now()),
       sender: 'user',
@@ -251,30 +259,30 @@ export function App() {
     try {
       const response = await api.processJarvisPrompt(text, messages, settings, language);
 
-      if (response.toolCalls && response.toolCalls.length > 0) {
+      if (response.toolCalls?.length) {
         setStatus('EXECUTING');
         for (const tc of response.toolCalls) {
           addLog(`Executed: ${tc.name}`, 'tool', 'success', JSON.stringify(tc.arguments));
         }
       }
 
-      // Add JARVIS message
       const replyText = response.text || response.reply || 'Action completed, Sir.';
       const hindiText = response.hindiText || response.hindiReply;
 
-      const jarvisMsg: ChatMessage = {
-        id: String(Date.now() + 1),
-        sender: 'jarvis',
-        text: replyText,
-        hindiText: hindiText,
-        toolCalls: response.toolCalls,
-        timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-      };
-      setMessages((prev) => [...prev, jarvisMsg]);
+      setMessages((prev) => [
+        ...prev,
+        {
+          id: String(Date.now() + 1),
+          sender: 'jarvis',
+          text: replyText,
+          hindiText,
+          toolCalls: response.toolCalls,
+          timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+        },
+      ]);
 
-      // Voice synthesis
       setStatus('SPEAKING');
-      voiceEngine.speak(
+      await voiceEngine.speak(
         replyText,
         language,
         settings.voiceGender,
@@ -282,14 +290,12 @@ export function App() {
         settings.voicePitch
       );
 
-      // Refresh metrics / memories
-      refreshMetrics();
-      api.getMemories().then(setMemories);
+      void refreshMetrics();
+      void api.getMemories().then(setMemories);
     } catch (err: any) {
       console.error('Error processing prompt', err);
       setStatus('ERROR');
       addLog(`Execution Error: ${err.message || 'Unknown error'}`, 'error', 'error');
-
       setMessages((prev) => [
         ...prev,
         {
@@ -301,20 +307,17 @@ export function App() {
       ]);
     } finally {
       setIsLoadingPrompt(false);
-      setTimeout(() => {
-        setStatus('IDLE');
-      }, 1200);
+      setTimeout(() => setStatus('IDLE'), 400);
     }
   };
 
-  // Direct Tool Execution
   const handleExecuteTool = async (toolName: string, args: Record<string, any>) => {
     setStatus('EXECUTING');
     addLog(`Direct Tool Call: ${toolName}`, 'tool', 'info', JSON.stringify(args));
     try {
       const res = await api.executeTool(toolName, args);
       addLog(`Tool ${toolName} completed`, 'tool', 'success', JSON.stringify(res.result || {}));
-      refreshMetrics();
+      void refreshMetrics();
     } catch (e: any) {
       addLog(`Tool ${toolName} failed`, 'error', 'error', e.message);
     } finally {
@@ -322,37 +325,29 @@ export function App() {
     }
   };
 
-  // Request dangerous tool with safety modal
   const handleRequestDangerousAction = (toolName: string, args: Record<string, any>, warningText: string) => {
     if (!settings.requireConfirmForDangerous) {
-      handleExecuteTool(toolName, args);
+      void handleExecuteTool(toolName, args);
       return;
     }
-    setSafetyModal({
-      isOpen: true,
-      toolName,
-      args,
-      warningText,
-    });
+    setSafetyModal({ isOpen: true, toolName, args, warningText });
     addLog(`Safety Check Prompted for: ${toolName}`, 'safety', 'info');
   };
 
   const handleConfirmDangerousAction = () => {
     const { toolName, args } = safetyModal;
     setSafetyModal({ isOpen: false, toolName: '', args: {}, warningText: '' });
-    handleExecuteTool(toolName, args);
+    void handleExecuteTool(toolName, args);
   };
 
-  // App launch helper
   const handleLaunchApp = (appName: string) => {
-    handleExecuteTool('open_application', { appName });
+    void handleExecuteTool('open_application', { appName });
   };
 
   const handleCloseApp = (processName: string) => {
-    handleExecuteTool('close_application', { processName });
+    void handleExecuteTool('close_application', { processName });
   };
 
-  // Process kill helper
   const handleKillProcess = (processName: string) => {
     handleRequestDangerousAction(
       'close_application',
@@ -361,7 +356,6 @@ export function App() {
     );
   };
 
-  // Routine execution
   const handleExecuteRoutine = async (id: string) => {
     setIsExecutingRoutineId(id);
     setStatus('EXECUTING');
@@ -369,7 +363,7 @@ export function App() {
     try {
       const res = await api.executeAutomation(id);
       addLog(`Routine completed with ${res.results?.length || 0} steps`, 'tool', 'success');
-      refreshMetrics();
+      void refreshMetrics();
     } catch (e: any) {
       addLog(`Routine failed: ${e.message}`, 'error', 'error');
     } finally {
@@ -378,7 +372,6 @@ export function App() {
     }
   };
 
-  // Routine creation
   const handleCreateRoutine = async (routine: Partial<AutomationRoutine>) => {
     try {
       const created = await api.createAutomation(routine);
@@ -389,7 +382,6 @@ export function App() {
     }
   };
 
-  // Memory handlers
   const handleAddMemory = async (mem: { category: string; key: string; value: string }) => {
     try {
       const created = await api.addMemory(mem);
@@ -420,7 +412,6 @@ export function App() {
     }
   };
 
-  // Settings update
   const handleSaveSettings = async (newSettings: AppSettings) => {
     setSettings(newSettings);
     await api.saveSettings(newSettings);
@@ -429,10 +420,8 @@ export function App() {
 
   return (
     <div className="min-h-screen bg-[#F5F8FC] text-slate-800 font-sans flex flex-col relative overflow-x-hidden selection:bg-cyan-500/20 selection:text-cyan-900">
-      {/* Startup Diagnostic Overlay */}
       {isBooting && <StartupSequenceModal onComplete={() => setIsBooting(false)} />}
 
-      {/* Top Application Bar */}
       <TopBar
         status={status}
         isListening={isListening}
@@ -446,9 +435,7 @@ export function App() {
         isAgentConnected={isAgentConnected}
       />
 
-      {/* Main Workspace Frame */}
       <div className="flex-1 flex overflow-hidden">
-        {/* Navigation Sidebar */}
         <Sidebar
           activeTab={activeTab}
           onSelectTab={setActiveTab}
@@ -456,11 +443,9 @@ export function App() {
           onToggleCollapse={() => setIsSidebarCollapsed(!isSidebarCollapsed)}
         />
 
-        {/* Dynamic Center Stage Content */}
         <main className="flex-1 p-6 overflow-y-auto max-w-7xl mx-auto w-full">
           {activeTab === 'home' && (
             <div className="space-y-6">
-              {/* Central Holographic AI Core */}
               <CentralCore
                 status={status}
                 isListening={isListening}
@@ -469,8 +454,6 @@ export function App() {
                 language={language}
                 isAgentConnected={isAgentConnected}
               />
-
-              {/* Full-width Live Conversation & Command Station */}
               <div className="w-full h-[580px]">
                 <ConversationPanel
                   messages={messages}
@@ -498,10 +481,7 @@ export function App() {
           )}
 
           {activeTab === 'pc_control' && (
-            <PcControlView
-              onExecuteTool={handleExecuteTool}
-              onRequestDangerousAction={handleRequestDangerousAction}
-            />
+            <PcControlView onExecuteTool={handleExecuteTool} onRequestDangerousAction={handleRequestDangerousAction} />
           )}
 
           {activeTab === 'applications' && (
@@ -520,9 +500,7 @@ export function App() {
             />
           )}
 
-          {activeTab === 'browser' && (
-            <BrowserControlView onExecuteTool={handleExecuteTool} />
-          )}
+          {activeTab === 'browser' && <BrowserControlView onExecuteTool={handleExecuteTool} />}
 
           {activeTab === 'automations' && (
             <AutomationsView
@@ -542,37 +520,18 @@ export function App() {
             />
           )}
 
-          {activeTab === 'vision' && (
-            <VisionScreenView
-              onExecuteTool={handleExecuteTool}
-              settings={settings}
-            />
-          )}
+          {activeTab === 'vision' && <VisionScreenView onExecuteTool={handleExecuteTool} settings={settings} />}
 
           {activeTab === 'system' && (
-            <DashboardView
-              metrics={systemMetrics}
-              onRefresh={refreshMetrics}
-              onKillProcess={handleKillProcess}
-            />
+            <DashboardView metrics={systemMetrics} onRefresh={refreshMetrics} onKillProcess={handleKillProcess} />
           )}
 
-          {activeTab === 'settings' && (
-            <SettingsView
-              settings={settings}
-              onSaveSettings={handleSaveSettings}
-            />
-          )}
+          {activeTab === 'settings' && <SettingsView settings={settings} onSaveSettings={handleSaveSettings} />}
         </main>
       </div>
 
-      {/* Companion Bridge Modal */}
-      <WindowsBridgeModal
-        isOpen={bridgeModalOpen}
-        onClose={() => setBridgeModalOpen(false)}
-      />
+      <WindowsBridgeModal isOpen={bridgeModalOpen} onClose={() => setBridgeModalOpen(false)} />
 
-      {/* Safety Confirmation Modal for Destructive Operations */}
       <SafetyConfirmModal
         isOpen={safetyModal.isOpen}
         toolName={safetyModal.toolName}
@@ -584,4 +543,5 @@ export function App() {
     </div>
   );
 }
+
 export default App;
