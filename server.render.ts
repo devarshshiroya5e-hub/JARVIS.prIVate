@@ -20,21 +20,19 @@ app.disable('x-powered-by');
 app.use(express.json({ limit: '25mb' }));
 app.use(express.urlencoded({ extended: true, limit: '25mb' }));
 
-// Vite writes the production frontend to dist/. Static assets must be served
-// before the SPA fallback; otherwise /assets/*.js requests receive index.html
-// and the browser reports a strict MIME-type module error.
 app.use(express.static(DIST_DIR, {
   index: false,
   redirect: false,
   fallthrough: true,
   setHeaders: (res, filePath) => {
-    if (filePath.includes(`${path.sep}assets${path.sep}`)) {
-      res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
-    } else {
-      res.setHeader('Cache-Control', 'no-cache');
-    }
+    if (filePath.includes(`${path.sep}assets${path.sep}`)) res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+    else res.setHeader('Cache-Control', 'no-cache');
   },
 }));
+
+// Browsers often request this automatically. A successful empty response keeps
+// the console clean without inventing a frontend asset.
+app.get('/favicon.ico', (_req, res) => res.status(204).end());
 
 app.get('/api/health', (_req, res) => {
   res.json({ status: 'online', aiProvider: 'openrouter', model: process.env.OPENROUTER_MODEL || 'openai/gpt-4o-mini', openRouterConfigured: Boolean(process.env.OPENROUTER_API_KEY), uptime: process.uptime(), timestamp: new Date().toISOString() });
@@ -179,13 +177,9 @@ app.get('/api/windows-bridge/script', (_req, res) => {
   res.type('text/plain').send(script);
 });
 
-// SPA fallback: only navigation-like GET requests without a file extension
-// should receive index.html. Asset/API requests must never be rewritten to HTML.
 app.get('*', (req, res) => {
   if (req.path.startsWith('/api/')) return res.status(404).json({ error: 'API route not found.' });
-  if (req.method !== 'GET' || path.extname(req.path) || !req.accepts('html')) {
-    return res.status(404).type('text/plain').send('Not Found');
-  }
+  if (req.method !== 'GET' || path.extname(req.path) || !req.accepts('html')) return res.status(404).type('text/plain').send('Not Found');
   if (!fs.existsSync(INDEX_FILE)) {
     console.error(`[Static] Missing frontend entry: ${INDEX_FILE}`);
     return res.status(503).type('text/plain').send('Frontend build is missing.');
