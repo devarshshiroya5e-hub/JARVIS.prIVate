@@ -46,6 +46,9 @@ export const api = {
       language,
       aiProvider: 'openrouter',
       openRouterModel: model,
+      // Allow a key entered in the UI to actually power the request. The server
+      // still prefers its environment variable when no per-request key is sent.
+      openRouterApiKey: settings?.openRouterApiKey?.trim() || undefined,
     };
 
     const startedAt = performance.now();
@@ -87,7 +90,12 @@ export const api = {
     const res = await fetchWithTimeout('/api/jarvis/analyze-screen', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ imageBase64, prompt, openRouterModel: model }),
+      body: JSON.stringify({
+        imageBase64,
+        prompt,
+        openRouterModel: model,
+        openRouterApiKey: settings?.openRouterApiKey?.trim() || undefined,
+      }),
     }, 60_000);
     if (!res.ok) {
       const err = await res.json().catch(() => ({ error: 'Vision analysis failed' }));
