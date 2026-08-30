@@ -40,9 +40,7 @@ export class VoiceEngine {
       this.recognitionCtor = ctor as SpeechRecognitionConstructor;
       this.recognition = new ctor();
       this.configureRecognition();
-    } catch (error) {
-      console.error('Speech recognition initialization failed:', error);
-    }
+    } catch (_) {}
   }
 
   private configureRecognition() {
@@ -85,25 +83,17 @@ export class VoiceEngine {
       this.recognitionStarting = false;
       const code = event?.error || 'unknown';
 
-      // Browser speech recognition may temporarily report network/service errors.
-      // Retry silently so a transient browser issue never becomes JARVIS SYSTEM ERROR.
       if (code === 'network' || code === 'service-not-allowed') {
         if (this.isListening) this.scheduleRecognitionRetry();
         return;
       }
-
       if (code === 'aborted' || code === 'no-speech') return;
 
-      const messages: Record<string, string> = {
-        'audio-capture': 'No microphone was detected. Check microphone permissions.',
-        'not-allowed': 'Microphone permission is blocked for this site.',
-      };
-      console.warn(messages[code] || `Speech recognition error: ${code}`);
+      // Permission/device failures are expected in some browsers or private
+      // windows. Keep JARVIS in standby instead of surfacing SYSTEM ERROR.
       this.isListening = false;
       this.onStateChange?.(false);
       this.stopAudioVisualizer();
-      // Do not call onError here. The voice bar should remain operational/standby,
-      // rather than changing the entire JARVIS core to SYSTEM ERROR.
     };
 
     this.recognition.onend = () => {
@@ -153,17 +143,17 @@ export class VoiceEngine {
       } catch (_) {}
     }
 
-    if (!this.recognition) {
-      console.warn('Voice input is not supported. Use the latest Chrome or Edge.');
-      return false;
-    }
+    if (!this.recognition) return false;
 
     this.stopSpeaking();
     this.isListening = true;
     this.onStateChange?.(true);
-    await this.initAudioVisualizer();
 
+    // Audio visualization is optional. A denied microphone permission must not
+    // prevent SpeechRecognition from starting or generate console noise.
+    await this.initAudioVisualizer();
     if (!this.isListening) return false;
+
     try {
       this.recognitionStarting = true;
       this.recognition.start();
@@ -176,11 +166,10 @@ export class VoiceEngine {
         this.recognitionStarting = true;
         this.recognition.start();
         return true;
-      } catch (error: any) {
+      } catch (_) {
         this.recognitionStarting = false;
         this.isListening = false;
         this.onStateChange?.(false);
-        console.warn('Could not start microphone recognition:', error?.message || error);
         this.stopAudioVisualizer();
         return false;
       }
@@ -226,8 +215,8 @@ export class VoiceEngine {
       this.analyser.smoothingTimeConstant = 0.65;
       source.connect(this.analyser);
       this.audioDataArray = new Uint8Array(this.analyser.frequencyBinCount);
-    } catch (error) {
-      console.warn('Microphone visualizer unavailable; voice recognition can still work.', error);
+    } catch (_) {
+      // Visualizer is enhancement-only. Speech recognition may still work.
     }
   }
 
