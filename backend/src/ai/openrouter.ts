@@ -1,12 +1,22 @@
 import { db } from '../database/store';
 import { JARVIS_TOOL_REGISTRY } from '../../../shared/tools';
 
-const DEFAULT_OPENROUTER_MODEL = 'minimax/minimax-m3:free';
+const DEFAULT_OPENROUTER_MODEL = 'openrouter/free';
+const TOOL_CAPABLE_FALLBACKS = ['google/gemma-4-31b-it:free', 'minimax/minimax-m3:free'] as const;
 const REQUEST_TIMEOUT_MS = 45_000;
-const MAX_TOOL_ROUNDS = 4;
+const MAX_TOOL_ROUNDS = 6;
 
-// Keep the autonomous surface deliberately small and deterministic. Dangerous
-// actions are excluded and remain UI-confirmed operations.
+type ConversationMessage = { sender: 'user' | 'jarvis' | 'assistant'; text: string };
+
+type ToolCallInfo = {
+  id: string;
+  name: string;
+  arguments: Record<string, any>;
+  result?: any;
+  status: 'success' | 'failed';
+  timestamp: string;
+};
+
 const AI_TOOL_NAMES = new Set([
   'open_application',
   'close_application',
@@ -19,6 +29,10 @@ const AI_TOOL_NAMES = new Set([
   'double_click_mouse',
   'take_screenshot',
   'open_url',
+  'search_web',
+  'browser_open',
+  'browser_click',
+  'browser_type',
   'list_files',
   'search_files',
   'create_folder',
@@ -32,6 +46,20 @@ const AI_TOOL_NAMES = new Set([
   'get_system_metrics',
 ]);
 
+function sanitizeSchema(schema: any): any {
+  if (!schema || typeof schema !== 'object') return schema;
+  if (Array.isArray(schema)) return schema.map(sanitizeSchema);
+
+  const out: Record<string, any> = { ...schema };
+  if (out.type === 'array' && !out.items) out.items = { type: 'string' };
+  if (out.properties && typeof out.properties === 'object') {
+    out.properties = Object.fromEntries(Object.entries(out.properties).map(([key, value]) => [key, sanitizeSchema(value)]));
+  }
+  if (out.items) out.items = sanitizeSchema(out.items);
+  if (out.additionalProperties && typeof out.additionalProperties === 'object') out.additionalProperties = sanitizeSchema(out.additionalProperties);
+  return out;
+}
+
 const OPENROUTER_TOOLS = JARVIS_TOOL_REGISTRY
   .filter((tool) => AI_TOOL_NAMES.has(tool.name) && tool.safetyLevel === 'safe')
   .map((tool) => ({
@@ -39,20 +67,19 @@ const OPENROUTER_TOOLS = JARVIS_TOOL_REGISTRY
     function: {
       name: tool.name,
       description: tool.description,
-      parameters: tool.parameters,
+      parameters: sanitizeSchema(tool.parameters),
     },
   }));
 
-type ConversationMessage = { sender: 'user' | 'jarvis' | 'assistant'; text: string };
+function isKnownBrokenModel(model: string) {
+  const normalized = model.trim().toLowerCase();
+  return !normalized || normalized.includes('content-safety') || normalized.includes('guardrail');
+}
 
-type ToolCallInfo = {
-  id: string;
-  name: string;
-  arguments: Record<string, any>;
-  result?: any;
-  status: 'success' | 'failed';
-  timestamp: string;
-};
+function modelCandidates(requested?: string) {
+  const values = [requested, process.env.OPENROUTER_MODEL, DEFAULT_OPENROUTER_MODEL, ...TOOL_CAPABLE_FALLBACKS];
+  return [...new Set(values.filter((value): value is string => !!value && !isKnownBrokenModel(value)).map((value) => value.trim()))];
+}
 
 export interface OpenRouterRequestOptions {
   prompt: string;
@@ -69,19 +96,6 @@ export interface OpenRouterResponse {
   text: string;
   hindiText?: string;
   toolCalls: ToolCallInfo[];
-}
-
-function isKnownBrokenModel(model: string) {
-  const normalized = model.trim().toLowerCase();
-  return !normalized || normalized.includes('content-safety') || normalized.includes('guardrail');
-}
-
-function resolveModel(requested?: string) {
-  const candidates = [requested, process.env.OPENROUTER_MODEL, DEFAULT_OPENROUTER_MODEL];
-  for (const candidate of candidates) {
-    if (candidate && !isKnownBrokenModel(candidate)) return candidate.trim();
-  }
-  return DEFAULT_OPENROUTER_MODEL;
 }
 
 export class OpenRouterService {
@@ -129,30 +143,32 @@ Known user memories:\n${memoryContext || '(none)'}`;
     ];
   }
 
+  private async plainFallback(messages: any[], apiKey: string, candidates: string[]) {
+    for (const model of candidates) {
+      try {
+        const response = await this.request({ model, messages, temperature: 0.2, max_tokens: 1024 }, apiKey);
+        if (!response.ok) continue;
+        const data: any = await response.json();
+        const text = data.choices?.[0]?.message?.content?.trim();
+        if (text) return { model, text };
+      } catch (_) {}
+    }
+    return null;
+  }
+
   public async sendMessage(options: OpenRouterRequestOptions): Promise<OpenRouterResponse> {
     const apiKey = this.getApiKey(options.apiKey);
     if (!apiKey) throw new Error('OPENROUTER_API_KEY is not configured. Add your OpenRouter key in JARVIS Settings or Render.');
 
-    let model = resolveModel(options.model);
+    const candidates = modelCandidates(options.model);
     const messages: any[] = this.buildMessages(options);
     const toolCalls: ToolCallInfo[] = [];
+    let lastError = '';
 
-    for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
-      let response = await this.request({
-        model,
-        messages,
-        tools: OPENROUTER_TOOLS,
-        tool_choice: 'auto',
-        temperature: 0.2,
-        max_tokens: 1024,
-      }, apiKey);
-
-      if (!response.ok) {
-        const firstError = await response.text();
-        const shouldRetryWithDefault = response.status === 400 && /tool|function|model|badrequest|unsupported/i.test(firstError);
-        if (shouldRetryWithDefault && model !== DEFAULT_OPENROUTER_MODEL) {
-          model = DEFAULT_OPENROUTER_MODEL;
-          response = await this.request({
+    for (const model of candidates) {
+      try {
+        for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
+          const response = await this.request({
             model,
             messages,
             tools: OPENROUTER_TOOLS,
@@ -160,78 +176,77 @@ Known user memories:\n${memoryContext || '(none)'}`;
             temperature: 0.2,
             max_tokens: 1024,
           }, apiKey);
-        }
-        if (!response.ok) {
-          const finalError = await response.text();
-          // Never let a provider-side tool validation error take down basic chat.
-          const plainResponse = await this.request({ model: DEFAULT_OPENROUTER_MODEL, messages, temperature: 0.2, max_tokens: 1024 }, apiKey);
-          if (plainResponse.ok) {
-            const plainData: any = await plainResponse.json();
+
+          if (!response.ok) {
+            lastError = await response.text();
+            break;
+          }
+
+          const data: any = await response.json();
+          const message = data.choices?.[0]?.message;
+          const calls = Array.isArray(message?.tool_calls) ? message.tool_calls : [];
+
+          if (!calls.length) {
             return {
               source: 'openrouter',
-              model: DEFAULT_OPENROUTER_MODEL,
-              text: plainData.choices?.[0]?.message?.content?.trim() || 'I am online, Sir.',
+              model,
+              text: message?.content?.trim() || 'At your service, Sir.',
               toolCalls,
             };
           }
-          throw new Error(`OpenRouter error (${response.status}): ${finalError || firstError}`);
-        }
-      }
 
-      const data: any = await response.json();
-      const message = data.choices?.[0]?.message;
-      const calls = Array.isArray(message?.tool_calls) ? message.tool_calls : [];
+          messages.push(message);
 
-      if (!calls.length) {
-        return {
-          source: 'openrouter',
-          model,
-          text: message?.content?.trim() || 'At your service, Sir.',
-          toolCalls,
-        };
-      }
+          for (const call of calls) {
+            const name = call?.function?.name || '';
+            let args: Record<string, any> = {};
+            try { args = JSON.parse(call?.function?.arguments || '{}'); } catch (_) {}
 
-      messages.push(message);
+            let result: any;
+            try {
+              if (!AI_TOOL_NAMES.has(name) || !options.executeTool) {
+                result = { success: false, error: `Tool ${name} is not available.` };
+              } else {
+                result = await options.executeTool(name, args);
+              }
+            } catch (error: any) {
+              result = { success: false, error: error?.message || String(error) };
+            }
 
-      for (const call of calls) {
-        const name = call?.function?.name || '';
-        let args: Record<string, any> = {};
-        try { args = JSON.parse(call?.function?.arguments || '{}'); } catch (_) {}
+            toolCalls.push({
+              id: call?.id || `tool_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+              name,
+              arguments: args,
+              result,
+              status: result?.success === false ? 'failed' : 'success',
+              timestamp: new Date().toISOString(),
+            });
 
-        let result: any;
-        try {
-          if (!AI_TOOL_NAMES.has(name) || !options.executeTool) {
-            result = { success: false, error: `Tool ${name} is not available.` };
-          } else {
-            result = await options.executeTool(name, args);
+            messages.push({
+              role: 'tool',
+              tool_call_id: call?.id,
+              content: JSON.stringify(result),
+            });
           }
-        } catch (error: any) {
-          result = { success: false, error: error?.message || String(error) };
         }
 
-        toolCalls.push({
-          id: call?.id || `tool_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-          name,
-          arguments: args,
-          result,
-          status: result?.success === false ? 'failed' : 'success',
-          timestamp: new Date().toISOString(),
-        });
-
-        messages.push({
-          role: 'tool',
-          tool_call_id: call?.id,
-          content: JSON.stringify(result),
-        });
+        // Some providers reject one or more tool schemas while still accepting normal chat.
+        // Keep JARVIS usable instead of surfacing a provider 400 to the UI.
+        const plain = await this.plainFallback(messages, apiKey, [model, ...candidates.filter((candidate) => candidate !== model)]);
+        if (plain) {
+          return {
+            source: 'openrouter',
+            model: plain.model,
+            text: plain.text,
+            toolCalls,
+          };
+        }
+      } catch (error: any) {
+        lastError = error?.message || String(error);
       }
     }
 
-    return {
-      source: 'openrouter',
-      model,
-      text: 'The requested actions were processed, Sir.',
-      toolCalls,
-    };
+    throw new Error(`OpenRouter could not process the request. ${lastError || 'No compatible model/provider was available.'}`);
   }
 }
 
