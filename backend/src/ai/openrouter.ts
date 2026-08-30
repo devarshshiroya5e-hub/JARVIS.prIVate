@@ -1,6 +1,6 @@
 import { db } from '../database/store';
 
-const OPENROUTER_MODEL = 'nvidia/nemotron-3.5-content-safety:free';
+const DEFAULT_OPENROUTER_MODEL = 'minimax/minimax-m3:free';
 const REQUEST_TIMEOUT_MS = 45_000;
 
 type ConversationMessage = { sender: 'user' | 'jarvis'; text: string };
@@ -26,6 +26,10 @@ export class OpenRouterService {
     return (overrideKey || process.env.OPENROUTER_API_KEY || '').trim();
   }
 
+  private getModel(overrideModel?: string): string {
+    return (overrideModel || process.env.OPENROUTER_MODEL || DEFAULT_OPENROUTER_MODEL).trim();
+  }
+
   private async request(body: Record<string, any>, apiKey: string, stream = false): Promise<Response> {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
@@ -36,7 +40,7 @@ export class OpenRouterService {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${apiKey}`,
           'HTTP-Referer': process.env.APP_URL || 'https://jarvis-private.onrender.com',
-          'X-Title': 'JARVIS NVIDIA Nemotron 3.5',
+          'X-Title': 'JARVIS Personal AI',
         },
         body: JSON.stringify({ ...body, stream }),
         signal: controller.signal,
@@ -48,12 +52,14 @@ export class OpenRouterService {
 
   public async sendMessage(options: OpenRouterRequestOptions): Promise<OpenRouterResponse> {
     const apiKey = this.getApiKey(options.apiKey);
+    const model = this.getModel(options.model);
+
     if (!apiKey) {
       return {
         source: 'openrouter',
-        model: OPENROUTER_MODEL,
-        text: 'Sir, OPENROUTER_API_KEY is not configured on the server. Add your OpenRouter key in Render environment variables.',
-        hindiText: 'श्रीमान, server पर OPENROUTER_API_KEY configured नहीं है। Render environment variables में OpenRouter key जोड़ें।',
+        model,
+        text: 'Sir, OPENROUTER_API_KEY is not configured. Add it to the server environment or JARVIS settings.',
+        hindiText: 'श्रीमान, OPENROUTER_API_KEY configured नहीं है। Server environment या JARVIS settings में key जोड़ें।',
         toolCalls: [],
       };
     }
@@ -61,12 +67,11 @@ export class OpenRouterService {
     const memoryContext = db.getMemories().map((m) => `- ${m.key}: ${m.value}`).join('\n');
     const systemPrompt = `You are J.A.R.V.I.S., the personal AI command assistant for the user.
 Use concise, direct, useful answers. Support English, Hindi, and natural Hinglish.
-Do not pretend to perform computer actions. Direct desktop actions are handled by JARVIS local command routing and the Windows companion agent.
-You are running through NVIDIA Nemotron 3.5 Content Safety on OpenRouter.
+Do not claim to have performed computer actions unless a tool result confirms it. Desktop actions are handled by JARVIS local command routing and the Windows companion agent.
 Active memories:\n${memoryContext}`;
 
     const conversation = (options.conversationHistory || [])
-      .slice(-4)
+      .slice(-6)
       .map((m) => ({ role: m.sender === 'user' ? 'user' : 'assistant', content: m.text }));
 
     const messages = [
@@ -76,15 +81,15 @@ Active memories:\n${memoryContext}`;
     ];
 
     const response = await this.request({
-      model: OPENROUTER_MODEL,
+      model,
       messages,
       temperature: 0.2,
-      max_tokens: 512,
+      max_tokens: 768,
     }, apiKey);
 
     if (!response.ok) {
       const errorText = await response.text();
-      throw new Error(`OpenRouter NVIDIA Error (${response.status}): ${errorText}`);
+      throw new Error(`OpenRouter Error (${response.status}): ${errorText}`);
     }
 
     const data: any = await response.json();
@@ -92,7 +97,7 @@ Active memories:\n${memoryContext}`;
 
     return {
       source: 'openrouter',
-      model: OPENROUTER_MODEL,
+      model,
       text,
       toolCalls: [],
     };
@@ -100,24 +105,26 @@ Active memories:\n${memoryContext}`;
 
   public async *streamResponse(options: OpenRouterRequestOptions): AsyncGenerator<string, void, unknown> {
     const apiKey = this.getApiKey(options.apiKey);
+    const model = this.getModel(options.model);
+
     if (!apiKey) {
-      yield 'Sir, OPENROUTER_API_KEY is not configured on the server.';
+      yield 'Sir, OPENROUTER_API_KEY is not configured.';
       return;
     }
 
     const response = await this.request({
-      model: OPENROUTER_MODEL,
+      model,
       messages: [
         { role: 'system', content: 'You are JARVIS. Be concise, direct, safe, and helpful. Support English, Hindi, and Hinglish.' },
         { role: 'user', content: options.prompt.trim() },
       ],
       temperature: 0.2,
-      max_tokens: 512,
+      max_tokens: 768,
     }, apiKey, true);
 
     if (!response.ok || !response.body) {
       const errorText = await response.text();
-      throw new Error(`OpenRouter NVIDIA stream error (${response.status}): ${errorText}`);
+      throw new Error(`OpenRouter stream error (${response.status}): ${errorText}`);
     }
 
     const reader = response.body.getReader();
