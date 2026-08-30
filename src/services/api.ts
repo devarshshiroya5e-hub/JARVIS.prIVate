@@ -1,6 +1,6 @@
-import { SystemMetrics, MemoryItem, AutomationRoutine, ToolCallInfo, AppSettings } from '../types';
+import { SystemMetrics, MemoryItem, AutomationRoutine, AppSettings } from '../types';
 
-const FAST_AI_MODEL = 'google/gemini-2.5-flash-lite';
+const FAST_AI_MODEL = 'openai/gpt-4o-mini';
 const REQUEST_TIMEOUT_MS = 45_000;
 
 async function fetchWithTimeout(input: RequestInfo | URL, init: RequestInit = {}, timeoutMs = REQUEST_TIMEOUT_MS) {
@@ -25,22 +25,15 @@ export const api = {
     return res.json();
   },
 
-  async processJarvisPrompt(
-    prompt: string,
-    conversationHistory: any[] = [],
-    settings?: Partial<AppSettings>,
-    language: string = 'auto'
-  ) {
+  async processJarvisPrompt(prompt: string, conversationHistory: any[] = [], settings?: Partial<AppSettings>, language = 'auto') {
     const normalizedPrompt = prompt.trim();
     if (!normalizedPrompt) throw new Error('Prompt cannot be empty.');
 
-    // Keep the payload intentionally small for low latency while preserving short-term context.
     const payload = {
       prompt: normalizedPrompt,
       conversationHistory: conversationHistory.slice(-4),
       language,
-      aiProvider: settings?.aiProvider || 'gemini',
-      openRouterApiKey: settings?.openRouterApiKey || '',
+      aiProvider: 'openrouter',
       openRouterModel: settings?.openRouterModel || FAST_AI_MODEL,
     };
 
@@ -53,15 +46,13 @@ export const api = {
         body: JSON.stringify(payload),
       });
     } catch (error: any) {
-      if (error?.name === 'AbortError') {
-        throw new Error('JARVIS request timed out. Please try again.');
-      }
+      if (error?.name === 'AbortError') throw new Error('JARVIS request timed out. Please try again.');
       throw error;
     }
 
     if (!res.ok) {
       const err = await res.json().catch(() => ({ error: 'Unknown server error' }));
-      throw new Error(err.error || 'Server error processing request');
+      throw new Error(err.error || `OpenRouter server error (${res.status})`);
     }
 
     const data = await res.json();
@@ -71,9 +62,7 @@ export const api = {
 
   async executeTool(toolName: string, args: Record<string, any> = {}) {
     const res = await fetchWithTimeout('/api/tools/execute', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ toolName, args }),
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ toolName, args }),
     }, 20_000);
     if (!res.ok) {
       const err = await res.json().catch(() => ({ error: 'Tool execution failed' }));
@@ -86,13 +75,7 @@ export const api = {
     const res = await fetchWithTimeout('/api/jarvis/analyze-screen', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        imageBase64,
-        prompt,
-        aiProvider: settings?.aiProvider || 'gemini',
-        openRouterApiKey: settings?.openRouterApiKey || '',
-        openRouterModel: settings?.openRouterModel || FAST_AI_MODEL,
-      }),
+      body: JSON.stringify({ imageBase64, prompt, openRouterModel: settings?.openRouterModel || FAST_AI_MODEL }),
     }, 60_000);
     if (!res.ok) {
       const err = await res.json().catch(() => ({ error: 'Vision analysis failed' }));
@@ -101,16 +84,12 @@ export const api = {
     return res.json();
   },
 
-  async testOpenRouterKey(apiKey: string, model: string = FAST_AI_MODEL) {
+  async testOpenRouterKey(apiKey: string, model = FAST_AI_MODEL) {
     const res = await fetchWithTimeout('/api/openrouter/test', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ apiKey, model }),
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ apiKey, model }),
     }, 20_000);
     const data = await res.json();
-    if (!res.ok || !data.success) {
-      throw new Error(data.error || `HTTP ${res.status}: Failed to connect to OpenRouter`);
-    }
+    if (!res.ok || !data.success) throw new Error(data.error || `HTTP ${res.status}: Failed to connect to OpenRouter`);
     return data;
   },
 
@@ -121,11 +100,7 @@ export const api = {
   },
 
   async addMemory(memory: { category: string; key: string; value: string }): Promise<MemoryItem> {
-    const res = await fetchWithTimeout('/api/memory', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(memory),
-    });
+    const res = await fetchWithTimeout('/api/memory', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(memory) });
     const data = await res.json();
     return data.memory;
   },
@@ -147,32 +122,20 @@ export const api = {
   },
 
   async createAutomation(routine: Partial<AutomationRoutine>): Promise<AutomationRoutine> {
-    const res = await fetchWithTimeout('/api/automations', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(routine),
-    });
+    const res = await fetchWithTimeout('/api/automations', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(routine) });
     const data = await res.json();
     return data.routine || data.automation || data;
   },
 
-  async addAutomation(routine: Partial<AutomationRoutine>) {
-    return this.createAutomation(routine);
-  },
+  async addAutomation(routine: Partial<AutomationRoutine>) { return this.createAutomation(routine); },
 
   async updateAutomation(id: string, routine: Partial<AutomationRoutine>) {
-    const res = await fetchWithTimeout(`/api/automations/${id}`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(routine),
-    });
+    const res = await fetchWithTimeout(`/api/automations/${id}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(routine) });
     return res.json();
   },
 
   async executeAutomation(id: string) {
-    const res = await fetchWithTimeout(`/api/automations/${id}/execute`, {
-      method: 'POST',
-    }, 60_000);
+    const res = await fetchWithTimeout(`/api/automations/${id}/execute`, { method: 'POST' }, 60_000);
     return res.json();
   },
 
@@ -184,22 +147,18 @@ export const api = {
       const data = await res.json();
       return { script: data.script || '', filename: data.filename || 'jarvis_windows_bridge.py' };
     }
-    const text = await res.text();
-    return { script: text, filename: 'jarvis_windows_bridge.py' };
+    return { script: await res.text(), filename: 'jarvis_windows_bridge.py' };
   },
 
   async getSettings(): Promise<AppSettings> {
     const saved = localStorage.getItem('jarvis_settings');
-    if (saved) {
-      try {
-        return JSON.parse(saved);
-      } catch (_) {}
-    }
+    if (saved) { try { return JSON.parse(saved); } catch (_) {} }
     return {} as AppSettings;
   },
 
   async saveSettings(settings: AppSettings) {
-    localStorage.setItem('jarvis_settings', JSON.stringify(settings));
+    const normalized = { ...settings, aiProvider: 'openrouter', openRouterModel: settings.openRouterModel || FAST_AI_MODEL };
+    localStorage.setItem('jarvis_settings', JSON.stringify(normalized));
     return { status: 'ok' };
   },
 };
