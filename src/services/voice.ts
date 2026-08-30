@@ -1,16 +1,22 @@
 import { LanguageMode } from '../types';
 
+type SpeechRecognitionConstructor = new () => any;
+
 export class VoiceEngine {
   private recognition: any = null;
-  public isListening = false;
+  private recognitionCtor: SpeechRecognitionConstructor | null = null;
+  private recognitionStarting = false;
   private audioContext: AudioContext | null = null;
   private analyser: AnalyserNode | null = null;
   private micStream: MediaStream | null = null;
   private audioDataArray: Uint8Array | null = null;
+  private voicesReady = false;
 
+  public isListening = false;
   public onResult?: (text: string) => void;
   public onWakeWord?: (word: string) => void;
   public onStateChange?: (isListening: boolean) => void;
+  public onError?: (message: string) => void;
 
   public wakeWordEnabled = true;
   public wakeWords = ['jarvis', 'hey jarvis', 'ok jarvis', 'जार्विस', 'हे जार्विस', 'नमस्ते जार्विस'];
@@ -22,64 +28,94 @@ export class VoiceEngine {
 
   constructor() {
     this.initSpeechRecognition();
+    this.initSpeechSynthesis();
   }
 
   private initSpeechRecognition() {
-    const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-    if (!SpeechRecognition) {
-      console.warn('SpeechRecognition API not available in this browser.');
+    if (typeof window === 'undefined') return;
+
+    const ctor = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    if (!ctor) {
+      console.warn('SpeechRecognition API is unavailable in this browser.');
       return;
     }
 
     try {
-      this.recognition = new SpeechRecognition();
-      this.recognition.continuous = true;
-      this.recognition.interimResults = false;
+      this.recognitionCtor = ctor as SpeechRecognitionConstructor;
+      this.recognition = new ctor();
+      this.recognition.continuous = false;
+      this.recognition.interimResults = true;
       this.recognition.maxAlternatives = 1;
       this.updateLanguage();
 
+      this.recognition.onstart = () => {
+        this.recognitionStarting = false;
+        this.isListening = true;
+        this.onStateChange?.(true);
+      };
+
       this.recognition.onresult = (event: any) => {
         let finalTranscript = '';
+        let interimTranscript = '';
 
-        for (let i = event.resultIndex; i < event.results.length; ++i) {
-          if (event.results[i].isFinal) {
-            finalTranscript += event.results[i][0].transcript;
-          }
+        for (let i = event.resultIndex; i < event.results.length; i++) {
+          const result = event.results[i];
+          const transcript = result?.[0]?.transcript || '';
+          if (result.isFinal) finalTranscript += transcript;
+          else interimTranscript += transcript;
         }
 
-        const currentText = finalTranscript.trim();
+        const transcript = (finalTranscript || interimTranscript).trim();
+        if (!finalTranscript || !transcript) return;
 
-        // Check for wake word
-        if (this.wakeWordEnabled && currentText) {
-          const lower = currentText.toLowerCase();
-          const matched = this.wakeWords.find((w) => lower.includes(w));
-          if (matched && this.onWakeWord) {
-            this.playChime('wake');
-            this.onWakeWord(matched);
-          }
+        const lower = finalTranscript.trim().toLowerCase();
+        const matched = this.wakeWords.find((word) => lower.includes(word));
+        if (this.wakeWordEnabled && matched) {
+          this.playChime('wake');
+          this.onWakeWord?.(matched);
         }
 
-        if (this.onResult && currentText) {
-          this.onResult(currentText);
-        }
+        // One-shot recognition prevents JARVIS from hearing its own spoken response.
+        this.stopRecognitionOnly();
+        this.onResult?.(finalTranscript.trim());
       };
 
       this.recognition.onerror = (event: any) => {
-        if (event.error !== 'no-speech') {
-          console.warn('Speech recognition error:', event.error);
-        }
+        this.recognitionStarting = false;
+        const code = event?.error || 'unknown';
+        if (code === 'aborted' || code === 'no-speech') return;
+
+        const messages: Record<string, string> = {
+          'audio-capture': 'No microphone was detected. Check your microphone and browser permissions.',
+          'not-allowed': 'Microphone permission was denied. Allow microphone access for this site and try again.',
+          'network': 'Browser speech recognition could not reach its speech service. Check your internet connection.',
+          'service-not-allowed': 'Speech recognition is blocked by the browser or device policy.',
+        };
+        const message = messages[code] || `Speech recognition error: ${code}`;
+        console.warn(message);
+        this.onError?.(message);
+        this.stopListening(false);
       };
 
       this.recognition.onend = () => {
+        this.recognitionStarting = false;
+        // Deliberately do not auto-restart. Each mic press captures one clean command.
         if (this.isListening) {
-          try {
-            this.recognition.start();
-          } catch (_) {}
+          this.isListening = false;
+          this.onStateChange?.(false);
         }
       };
-    } catch (e) {
-      console.error('Failed to initialize Speech Recognition:', e);
+    } catch (error: any) {
+      console.error('Failed to initialize Speech Recognition:', error);
+      this.onError?.('Speech recognition could not be initialized in this browser.');
     }
+  }
+
+  private initSpeechSynthesis() {
+    if (typeof window === 'undefined' || !('speechSynthesis' in window)) return;
+    const markReady = () => { this.voicesReady = true; };
+    window.speechSynthesis.addEventListener('voiceschanged', markReady, { once: false });
+    markReady();
   }
 
   public setLanguage(lang: LanguageMode) {
@@ -91,60 +127,107 @@ export class VoiceEngine {
     if (!this.recognition) return;
     if (this.language === 'hi') {
       this.recognition.lang = 'hi-IN';
-    } else if (this.language === 'en') {
-      this.recognition.lang = 'en-US';
     } else {
+      // Auto mode defaults to English for reliable recognition; Hindi can be selected explicitly.
       this.recognition.lang = 'en-US';
     }
   }
 
-  public async startListening(lang?: LanguageMode) {
-    if (lang) {
-      this.setLanguage(lang);
-    }
-    this.isListening = true;
-    if (this.onStateChange) this.onStateChange(true);
+  public async startListening(lang?: LanguageMode): Promise<boolean> {
+    if (lang) this.setLanguage(lang);
 
-    try {
-      if (this.recognition) {
-        this.recognition.start();
-      }
-    } catch (e) {
-      // Already running
-    }
-
-    await this.initAudioVisualizer();
-  }
-
-  public stopListening() {
-    this.isListening = false;
-    if (this.onStateChange) this.onStateChange(false);
-    if (this.recognition) {
+    if (!this.recognition && this.recognitionCtor) {
       try {
-        this.recognition.stop();
+        this.recognition = new this.recognitionCtor();
+        this.recognition.continuous = false;
+        this.recognition.interimResults = true;
+        this.recognition.maxAlternatives = 1;
+        this.updateLanguage();
       } catch (_) {}
     }
+
+    if (!this.recognition) {
+      const message = 'Voice input is not supported by this browser. Use the latest Chrome or Edge.';
+      this.onError?.(message);
+      return false;
+    }
+
+    try {
+      // Prime the audio permission + visualizer from the same user interaction.
+      await this.initAudioVisualizer();
+      this.stopSpeaking();
+
+      if (!this.isListening && !this.recognitionStarting) {
+        this.recognitionStarting = true;
+        this.isListening = true;
+        this.onStateChange?.(true);
+        this.recognition.start();
+      }
+      return true;
+    } catch (error: any) {
+      this.recognitionStarting = false;
+      this.isListening = false;
+      this.onStateChange?.(false);
+      const message = error?.message?.includes('Permission')
+        ? 'Microphone permission is required for voice input.'
+        : 'Could not start the microphone. Please check browser permissions.';
+      this.onError?.(message);
+      this.stopAudioVisualizer();
+      return false;
+    }
+  }
+
+  private stopRecognitionOnly() {
+    if (this.recognition) {
+      try { this.recognition.stop(); } catch (_) {}
+    }
+    this.recognitionStarting = false;
+  }
+
+  public stopListening(notify = true) {
+    this.isListening = false;
+    this.recognitionStarting = false;
+    if (this.recognition) {
+      try { this.recognition.abort(); } catch (_) {
+        try { this.recognition.stop(); } catch (_) {}
+      }
+    }
+    if (notify) this.onStateChange?.(false);
     this.stopAudioVisualizer();
   }
 
-  // Web Audio Analyzer for dynamic audio waveforms and orb frequency reaction
   private async initAudioVisualizer() {
+    if (typeof window === 'undefined' || !navigator.mediaDevices?.getUserMedia) return;
+
     try {
       if (!this.audioContext) {
-        this.audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
+        const AudioContextCtor = window.AudioContext || (window as any).webkitAudioContext;
+        if (!AudioContextCtor) return;
+        this.audioContext = new AudioContextCtor();
       }
-      if (this.audioContext.state === 'suspended') {
-        await this.audioContext.resume();
-      }
+      if (this.audioContext.state === 'suspended') await this.audioContext.resume();
 
-      this.micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const source = this.audioContext.createMediaStreamSource(this.micStream);
-      this.analyser = this.audioContext.createAnalyser();
-      this.analyser.fftSize = 64;
-      source.connect(this.analyser);
-      this.audioDataArray = new Uint8Array(this.analyser.frequencyBinCount);
-    } catch (e) {
-      console.warn('Microphone visualizer stream unavailable:', e);
+      if (!this.micStream) {
+        this.micStream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            channelCount: 1,
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+          },
+          video: false,
+        });
+
+        const source = this.audioContext.createMediaStreamSource(this.micStream);
+        this.analyser = this.audioContext.createAnalyser();
+        this.analyser.fftSize = 64;
+        this.analyser.smoothingTimeConstant = 0.65;
+        source.connect(this.analyser);
+        this.audioDataArray = new Uint8Array(this.analyser.frequencyBinCount);
+      }
+    } catch (error) {
+      // SpeechRecognition can still work even if the visualizer stream is unavailable.
+      console.warn('Microphone visualizer unavailable:', error);
     }
   }
 
@@ -165,15 +248,12 @@ export class VoiceEngine {
 
   public getAverageAudioVolume(): number {
     const data = this.getAudioFrequencyData();
-    if (!data || data.length === 0) return 0;
+    if (!data?.length) return 0;
     let sum = 0;
-    for (let i = 0; i < data.length; i++) {
-      sum += data[i];
-    }
+    for (const value of data) sum += value;
     return sum / data.length;
   }
 
-  // Bilingual Speech Synthesis
   public speak(
     text: string,
     lang: 'en' | 'hi' | 'auto' = 'auto',
@@ -182,90 +262,73 @@ export class VoiceEngine {
     pitch?: number
   ): Promise<void> {
     return new Promise((resolve) => {
-      if (!('speechSynthesis' in window)) {
-        console.warn('SpeechSynthesis not supported.');
-        return resolve();
-      }
+      if (typeof window === 'undefined' || !('speechSynthesis' in window)) return resolve();
+      const synth = window.speechSynthesis;
 
-      window.speechSynthesis.cancel();
+      this.stopListening();
+      synth.cancel();
 
       const utterance = new SpeechSynthesisUtterance(text);
-      utterance.rate = rate ?? this.voiceRate;
-      utterance.pitch = pitch ?? this.voicePitch;
-      utterance.volume = this.voiceVolume;
+      utterance.rate = Math.min(2, Math.max(0.5, rate ?? this.voiceRate));
+      utterance.pitch = Math.min(2, Math.max(0, pitch ?? this.voicePitch));
+      utterance.volume = Math.min(1, Math.max(0, this.voiceVolume));
 
-      // Check if text is predominantly Hindi/Devanagari
       const hasDevanagari = /[\u0900-\u097F]/.test(text);
       const targetLang = lang === 'hi' || (lang === 'auto' && hasDevanagari) ? 'hi-IN' : 'en-US';
       utterance.lang = targetLang;
 
-      const voices = window.speechSynthesis.getVoices();
-      let matchedVoice = null;
+      const chooseVoice = () => {
+        const voices = synth.getVoices();
+        let matched: SpeechSynthesisVoice | undefined;
 
-      if (targetLang === 'hi-IN') {
-        matchedVoice = voices.find(
-          (v) =>
-            v.lang.includes('hi') ||
-            v.name.toLowerCase().includes('hindi') ||
-            v.name.toLowerCase().includes('india')
-        );
-      } else {
-        if (gender === 'male') {
-          matchedVoice =
-            voices.find((v) => v.lang.includes('en-GB') && v.name.toLowerCase().includes('male')) ||
-            voices.find(
-              (v) =>
-                v.lang.includes('en-GB') ||
-                v.name.toLowerCase().includes('daniel') ||
-                v.name.toLowerCase().includes('george')
-            ) ||
-            voices.find(
-              (v) =>
-                v.lang.includes('en-US') &&
-                (v.name.toLowerCase().includes('natural') || v.name.toLowerCase().includes('guy'))
-            ) ||
-            voices.find((v) => v.lang.startsWith('en'));
+        if (targetLang === 'hi-IN') {
+          matched = voices.find((v) => v.lang.toLowerCase().startsWith('hi')) ||
+            voices.find((v) => v.name.toLowerCase().includes('hindi'));
+        } else if (gender === 'male') {
+          matched = voices.find((v) => v.lang.toLowerCase() === 'en-gb' && /daniel|george|male/i.test(v.name)) ||
+            voices.find((v) => v.lang.toLowerCase().startsWith('en-gb')) ||
+            voices.find((v) => v.lang.toLowerCase().startsWith('en-us'));
         } else {
-          matchedVoice =
-            voices.find((v) => v.lang.includes('en-US') && v.name.toLowerCase().includes('female')) ||
-            voices.find(
-              (v) =>
-                v.lang.includes('en-US') ||
-                v.name.toLowerCase().includes('samantha') ||
-                v.name.toLowerCase().includes('victoria')
-            ) ||
-            voices.find((v) => v.lang.startsWith('en'));
+          matched = voices.find((v) => v.lang.toLowerCase().startsWith('en-us')) ||
+            voices.find((v) => v.lang.toLowerCase().startsWith('en'));
         }
-      }
 
-      if (matchedVoice) {
-        utterance.voice = matchedVoice;
+        if (matched) utterance.voice = matched;
+      };
+
+      if (!this.voicesReady || synth.getVoices().length === 0) {
+        const retry = () => chooseVoice();
+        synth.addEventListener('voiceschanged', retry, { once: true });
+      } else {
+        chooseVoice();
       }
 
       utterance.onend = () => resolve();
       utterance.onerror = () => resolve();
-
-      window.speechSynthesis.speak(utterance);
+      synth.speak(utterance);
     });
   }
 
   public stopSpeaking() {
-    if ('speechSynthesis' in window) {
+    if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
       window.speechSynthesis.cancel();
     }
   }
 
-  // Futuristic Web Audio Synthesizer Chimes
   public playChime(type: 'wake' | 'success' | 'execute' | 'error') {
     try {
-      const ctx = this.audioContext || new (window.AudioContext || (window as any).webkitAudioContext)();
-      if (ctx.state === 'suspended') ctx.resume();
+      if (!this.audioContext) {
+        const AudioContextCtor = window.AudioContext || (window as any).webkitAudioContext;
+        if (!AudioContextCtor) return;
+        this.audioContext = new AudioContextCtor();
+      }
+      const ctx = this.audioContext;
+      if (ctx.state === 'suspended') void ctx.resume();
 
       const osc = ctx.createOscillator();
       const gain = ctx.createGain();
       osc.connect(gain);
       gain.connect(ctx.destination);
-
       const now = ctx.currentTime;
 
       if (type === 'wake') {
@@ -291,10 +354,10 @@ export class VoiceEngine {
         gain.gain.exponentialRampToValueAtTime(0.001, now + 0.15);
         osc.start(now);
         osc.stop(now + 0.15);
-      } else if (type === 'error') {
+      } else {
         osc.type = 'sawtooth';
         osc.frequency.setValueAtTime(220, now);
-        gain.gain.exponentialRampToValueAtTime(110, now + 0.25);
+        osc.frequency.exponentialRampToValueAtTime(110, now + 0.25);
         gain.gain.setValueAtTime(0.05, now);
         gain.gain.exponentialRampToValueAtTime(0.001, now + 0.25);
         osc.start(now);
