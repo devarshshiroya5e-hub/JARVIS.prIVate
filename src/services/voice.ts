@@ -2,22 +2,15 @@ import { LanguageMode } from '../types';
 
 type SpeechRecognitionConstructor = new () => any;
 
-type SpeakOptions = {
-  rate?: number;
-  pitch?: number;
-  volume?: number;
-  gender?: 'male' | 'female';
-};
-
 export class VoiceEngine {
   private recognition: any = null;
   private recognitionCtor: SpeechRecognitionConstructor | null = null;
   private recognitionStarting = false;
   private recognitionRetryTimer: number | null = null;
   private audioContext: AudioContext | null = null;
-  private voicesReady = false;
   private speechGeneration = 0;
   private speechWatchdogTimer: number | null = null;
+  private visualizerData = new Uint8Array(48);
 
   public isListening = false;
   public isSpeaking = false;
@@ -122,11 +115,8 @@ export class VoiceEngine {
   private initSpeechSynthesis() {
     if (typeof window === 'undefined' || !('speechSynthesis' in window)) return;
     const synth = window.speechSynthesis;
-    const markReady = () => {
-      this.voicesReady = synth.getVoices().length > 0;
-    };
-    synth.addEventListener('voiceschanged', markReady);
-    markReady();
+    try { synth.addEventListener('voiceschanged', () => undefined); } catch (_) {}
+    try { synth.getVoices(); } catch (_) {}
   }
 
   public setLanguage(lang: LanguageMode) {
@@ -137,6 +127,27 @@ export class VoiceEngine {
   private updateLanguage() {
     if (!this.recognition) return;
     this.recognition.lang = this.language === 'hi' ? 'hi-IN' : 'en-US';
+  }
+
+  public getAudioFrequencyData(): Uint8Array {
+    // The Web Speech API does not expose microphone PCM/frequency data. Keep the
+    // visualizer API stable with a lightweight synthetic signal instead of
+    // crashing the entire React tree while listening/speaking.
+    const active = this.isListening || this.isSpeaking;
+    const t = performance.now() * 0.01;
+    for (let i = 0; i < this.visualizerData.length; i++) {
+      const wave = Math.sin(t + i * 0.55) * 0.5 + 0.5;
+      const pulse = active ? 0.35 + wave * 0.65 : 0.08 + wave * 0.12;
+      this.visualizerData[i] = Math.max(0, Math.min(255, Math.round(pulse * 255)));
+    }
+    return this.visualizerData;
+  }
+
+  public getAverageAudioVolume(): number {
+    const data = this.getAudioFrequencyData();
+    let sum = 0;
+    for (const value of data) sum += value;
+    return data.length ? sum / data.length : 0;
   }
 
   public async startListening(lang?: LanguageMode): Promise<boolean> {
@@ -250,9 +261,6 @@ export class VoiceEngine {
 
     const hasDevanagari = /[\u0900-\u097F]/.test(cleanText);
     const targetLang = lang === 'hi' || (lang === 'auto' && hasDevanagari) ? 'hi-IN' : 'en-US';
-    // Do not await voices here. On Chromium, delaying synth.speak() can lose the
-    // transient user activation from the button click. The browser's default
-    // voice is a safe fallback while voices are still loading.
     const voices = synth.getVoices();
     const voice = this.selectVoice(voices, targetLang, gender);
     const chunks = this.splitSpeech(cleanText);
@@ -269,10 +277,8 @@ export class VoiceEngine {
     }, watchdogMs);
 
     try {
-      // Schedule the first utterance immediately from the click-driven call stack.
-      for (let index = 0; index < chunks.length; index++) {
+      for (const chunk of chunks) {
         if (generation !== this.speechGeneration) break;
-        const chunk = chunks[index];
         await new Promise<void>((resolve) => {
           const utterance = new SpeechSynthesisUtterance(chunk);
           utterance.lang = targetLang;
@@ -296,7 +302,6 @@ export class VoiceEngine {
           };
           try {
             synth.speak(utterance);
-            // Some Chromium builds occasionally leave an utterance stuck in the queue.
             window.setTimeout(() => {
               if (!synth.speaking && !synth.pending) finish();
             }, Math.max(2500, chunk.length * 140));
