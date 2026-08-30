@@ -7,6 +7,7 @@ export class VoiceEngine {
   private recognitionCtor: SpeechRecognitionConstructor | null = null;
   private recognitionStarting = false;
   private recognitionRetryTimer: number | null = null;
+  private recognitionShouldRestart = false;
   private audioContext: AudioContext | null = null;
   private speechGeneration = 0;
   private speechWatchdogTimer: number | null = null;
@@ -73,6 +74,7 @@ export class VoiceEngine {
         this.onWakeWord?.(matched);
       }
 
+      this.recognitionShouldRestart = false;
       this.stopRecognitionOnly();
       this.isListening = false;
       this.onStateChange?.(false);
@@ -82,11 +84,37 @@ export class VoiceEngine {
     this.recognition.onerror = (event: any) => {
       this.recognitionStarting = false;
       const code = event?.error || 'unknown';
-      if (code === 'network' || code === 'service-not-allowed') {
-        if (this.isListening) this.scheduleRecognitionRetry();
+
+      // These are terminal browser/permission errors. Retrying them creates an
+      // invisible loop and makes PTT appear to do nothing.
+      if (code === 'not-allowed' || code === 'service-not-allowed') {
+        this.recognitionShouldRestart = false;
+        this.isListening = false;
+        this.onStateChange?.(false);
+        this.onError?.('Microphone access was denied. In Chrome, click the lock icon next to the address, allow Microphone for JARVIS, then try Voice PTT again.');
         return;
       }
+
+      if (code === 'audio-capture') {
+        this.recognitionShouldRestart = false;
+        this.isListening = false;
+        this.onStateChange?.(false);
+        this.onError?.('Chrome could not access a microphone. Check Windows microphone permissions and that no other app is exclusively using the mic.');
+        return;
+      }
+
+      if (code === 'network') {
+        // Chromium speech recognition can briefly lose its speech service. Retry
+        // a few times only while the user still has the PTT session active.
+        if (this.isListening) {
+          this.scheduleRecognitionRetry();
+          return;
+        }
+      }
+
       if (code === 'aborted' || code === 'no-speech') return;
+
+      this.recognitionShouldRestart = false;
       this.isListening = false;
       this.onStateChange?.(false);
       this.onError?.(`Voice recognition error: ${code}`);
@@ -94,29 +122,27 @@ export class VoiceEngine {
 
     this.recognition.onend = () => {
       this.recognitionStarting = false;
-      if (this.isListening) this.scheduleRecognitionRetry();
+      if (this.isListening && this.recognitionShouldRestart) this.scheduleRecognitionRetry();
     };
   }
 
   private scheduleRecognitionRetry() {
-    if (this.recognitionRetryTimer !== null || !this.isListening || !this.recognition) return;
+    if (this.recognitionRetryTimer !== null || !this.isListening || !this.recognition || !this.recognitionShouldRestart) return;
     this.recognitionRetryTimer = window.setTimeout(() => {
       this.recognitionRetryTimer = null;
-      if (!this.isListening || this.recognitionStarting) return;
+      if (!this.isListening || !this.recognitionShouldRestart || this.recognitionStarting) return;
       try {
         this.recognitionStarting = true;
         this.recognition.start();
       } catch (_) {
         this.recognitionStarting = false;
       }
-    }, 350);
+    }, 500);
   }
 
   private initSpeechSynthesis() {
     if (typeof window === 'undefined' || !('speechSynthesis' in window)) return;
-    const synth = window.speechSynthesis;
-    try { synth.addEventListener('voiceschanged', () => undefined); } catch (_) {}
-    try { synth.getVoices(); } catch (_) {}
+    try { window.speechSynthesis.getVoices(); } catch (_) {}
   }
 
   public setLanguage(lang: LanguageMode) {
@@ -126,13 +152,10 @@ export class VoiceEngine {
 
   private updateLanguage() {
     if (!this.recognition) return;
-    this.recognition.lang = this.language === 'hi' ? 'hi-IN' : 'en-US';
+    this.recognition.lang = this.language === 'hi' ? 'hi-IN' : 'en-IN';
   }
 
   public getAudioFrequencyData(): Uint8Array {
-    // The Web Speech API does not expose microphone PCM/frequency data. Keep the
-    // visualizer API stable with a lightweight synthetic signal instead of
-    // crashing the entire React tree while listening/speaking.
     const active = this.isListening || this.isSpeaking;
     const t = performance.now() * 0.01;
     for (let i = 0; i < this.visualizerData.length; i++) {
@@ -150,6 +173,27 @@ export class VoiceEngine {
     return data.length ? sum / data.length : 0;
   }
 
+  private async ensureMicrophonePermission(): Promise<boolean> {
+    if (typeof navigator === 'undefined' || !navigator.mediaDevices?.getUserMedia) {
+      return true;
+    }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      for (const track of stream.getTracks()) track.stop();
+      return true;
+    } catch (error: any) {
+      const name = error?.name || '';
+      if (name === 'NotAllowedError' || name === 'SecurityError') {
+        this.onError?.('Microphone permission is blocked for JARVIS. Click the lock/site controls icon in Chrome, allow Microphone, and reload the page.');
+      } else if (name === 'NotFoundError' || name === 'DevicesNotFoundError') {
+        this.onError?.('No microphone was found. Connect a microphone and try again.');
+      } else {
+        this.onError?.(`Microphone could not be opened: ${error?.message || name || 'unknown error'}`);
+      }
+      return false;
+    }
+  }
+
   public async startListening(lang?: LanguageMode): Promise<boolean> {
     if (lang) this.setLanguage(lang);
     if (!this.recognition && this.recognitionCtor) {
@@ -159,11 +203,15 @@ export class VoiceEngine {
       } catch (_) {}
     }
     if (!this.recognition) {
-      this.onError?.('Speech recognition is not supported by this browser.');
+      this.onError?.('Speech recognition is not supported by this browser. Use a current Chrome or Edge browser for Voice PTT.');
       return false;
     }
 
+    const permissionGranted = await this.ensureMicrophonePermission();
+    if (!permissionGranted) return false;
+
     this.stopSpeaking();
+    this.recognitionShouldRestart = true;
     this.isListening = true;
     this.onStateChange?.(true);
 
@@ -174,16 +222,17 @@ export class VoiceEngine {
     } catch (_) {
       this.recognitionStarting = false;
       await new Promise((resolve) => window.setTimeout(resolve, 120));
-      if (!this.isListening) return false;
+      if (!this.isListening || !this.recognitionShouldRestart) return false;
       try {
         this.recognitionStarting = true;
         this.recognition.start();
         return true;
       } catch (_) {
         this.recognitionStarting = false;
+        this.recognitionShouldRestart = false;
         this.isListening = false;
         this.onStateChange?.(false);
-        this.onError?.('Microphone could not be started. Check browser microphone permission.');
+        this.onError?.('Microphone could not be started. Allow microphone access for this JARVIS site in Chrome and try again.');
         return false;
       }
     }
@@ -202,6 +251,7 @@ export class VoiceEngine {
 
   public stopListening(notify = true) {
     this.isListening = false;
+    this.recognitionShouldRestart = false;
     this.stopRecognitionOnly();
     if (notify) this.onStateChange?.(false);
   }
