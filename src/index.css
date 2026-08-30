@@ -1,0 +1,63 @@
+@import "tailwindcss";
+
+@layer utilities {
+  .hud-glass {
+    background: rgba(255, 255, 255, 0.82);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    border: 1px solid #DDE7F2;
+  }
+
+  .hud-glass-dark {
+    background: rgba(23, 32, 51, 0.95);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    border: 1px solid rgba(22, 189, 227, 0.3);
+  }
+
+  .cyber-grid {
+    background-size: 32px 32px;
+    background-image: 
+      linear-gradient(to right, rgba(221, 231, 242, 0.45) 1px, transparent 1px),
+      linear-gradient(to bottom, rgba(221, 231, 242, 0.45) 1px, transparent 1px);
+  }
+
+  .orb-glow {
+    box-shadow: 0 0 50px rgba(22, 189, 227, 0.28), inset 0 0 25px rgba(102, 117, 245, 0.2);
+  }
+
+  .orb-glow-danger {
+    box-shadow: 0 0 50px rgba(244, 63, 94, 0.35), inset 0 0 25px rgba(244, 63, 94, 0.2);
+  }
+
+  .hud-border {
+    border: 1px solid #DDE7F2;
+  }
+
+  .hud-card {
+    background: rgba(255, 255, 255, 0.85);
+    backdrop-filter: blur(12px);
+    border: 1px solid #DDE7F2;
+    border-radius: 1rem;
+    box-shadow: 0 2px 8px -2px rgba(15, 23, 42, 0.05);
+  }
+}
+
+/* Custom scrollbars for high-density workstation HUD */
+::-webkit-scrollbar {
+  width: 5px;
+  height: 5px;
+}
+
+::-webkit-scrollbar-track {
+  background: rgba(245, 248, 252, 0.6);
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(22, 189, 227, 0.25);
+  border-radius: 9999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(22, 189, 227, 0.5);
+}
