@@ -23,6 +23,7 @@ export class JarvisWebSocketClient {
   private backendConnected = false;
   private reconnectAttempts = 0;
   private agentEnabled = false;
+  private browserFallbackWindow: Window | null = null;
 
   constructor() {
     this.init();
@@ -272,10 +273,10 @@ export class JarvisWebSocketClient {
       return raw ? (/^https?:\/\//i.test(raw) ? raw : `https://${raw}`) : null;
     }
     if (tool === 'search_web') {
-      const q = String(args.query || '').trim();
-      if (!q) return null;
+      const query = String(args.query || '').trim();
+      if (!query) return null;
       const engine = String(args.engine || 'google').toLowerCase();
-      const encoded = encodeURIComponent(q);
+      const encoded = encodeURIComponent(query);
       if (engine === 'youtube') return `https://www.youtube.com/results?search_query=${encoded}`;
       if (engine === 'github') return `https://github.com/search?q=${encoded}`;
       if (engine === 'wikipedia') return `https://en.wikipedia.org/wiki/Special:Search?search=${encoded}`;
@@ -294,7 +295,7 @@ export class JarvisWebSocketClient {
           success: true,
           action: 'open_application',
           application: app,
-          message: 'Browser session is already active. Continuing with browser actions without the Windows companion.',
+          message: 'The browser is already active, so I am continuing the browser task without requiring the Windows companion.',
           browserFallback: true,
           nativeAgentRequired: false,
         };
@@ -306,23 +307,35 @@ export class JarvisWebSocketClient {
     if (!url) return null;
 
     try {
-      const newWindow = window.open(url, '_blank', 'noopener,noreferrer');
+      let opened = false;
+      let reused = false;
+      if (this.browserFallbackWindow && !this.browserFallbackWindow.closed) {
+        this.browserFallbackWindow.location.href = url;
+        opened = true;
+        reused = true;
+      } else {
+        const newWindow = window.open(url, '_blank', 'noopener,noreferrer');
+        if (newWindow) {
+          this.browserFallbackWindow = newWindow;
+          opened = true;
+        }
+      }
       return {
-        success: true,
+        success: opened,
         action: tool,
         url,
-        message: newWindow
-          ? `Opened ${url} in a new browser tab.`
-          : `Prepared ${url}. Chrome blocked the new tab; the URL is available in the tool result.`,
+        message: opened
+          ? `${reused ? 'Navigated' : 'Opened'} ${url} in the JARVIS browser session.`
+          : `Chrome blocked the new browser tab. Target URL: ${url}`,
         browserFallback: true,
-        popupBlocked: !newWindow,
+        popupBlocked: !opened,
       };
     } catch (_) {
       return {
-        success: true,
+        success: false,
         action: tool,
         url,
-        message: `Prepared ${url} for browser navigation.`,
+        message: `Unable to open the browser tab. Target URL: ${url}`,
         browserFallback: true,
         popupBlocked: true,
       };
