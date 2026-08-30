@@ -1,6 +1,6 @@
 import { SystemMetrics, MemoryItem, AutomationRoutine, AppSettings } from '../types';
 
-const FAST_AI_MODEL = 'openai/gpt-4o-mini';
+const FAST_AI_MODEL = 'nvidia/nemotron-3.5-content-safety:free';
 const REQUEST_TIMEOUT_MS = 45_000;
 
 async function fetchWithTimeout(input: RequestInfo | URL, init: RequestInit = {}, timeoutMs = REQUEST_TIMEOUT_MS) {
@@ -12,6 +12,13 @@ async function fetchWithTimeout(input: RequestInfo | URL, init: RequestInit = {}
     window.clearTimeout(timer);
   }
 }
+
+const normalizeSettings = (settings: Partial<AppSettings> = {}): AppSettings => ({
+  ...settings,
+  aiProvider: 'openrouter',
+  openRouterModel: FAST_AI_MODEL,
+  geminiModel: FAST_AI_MODEL,
+} as AppSettings);
 
 export const api = {
   async getHealth() {
@@ -25,7 +32,7 @@ export const api = {
     return res.json();
   },
 
-  async processJarvisPrompt(prompt: string, conversationHistory: any[] = [], settings?: Partial<AppSettings>, language = 'auto') {
+  async processJarvisPrompt(prompt: string, conversationHistory: any[] = [], _settings?: Partial<AppSettings>, language = 'auto') {
     const normalizedPrompt = prompt.trim();
     if (!normalizedPrompt) throw new Error('Prompt cannot be empty.');
 
@@ -34,7 +41,7 @@ export const api = {
       conversationHistory: conversationHistory.slice(-4),
       language,
       aiProvider: 'openrouter',
-      openRouterModel: settings?.openRouterModel || FAST_AI_MODEL,
+      openRouterModel: FAST_AI_MODEL,
     };
 
     const startedAt = performance.now();
@@ -52,7 +59,7 @@ export const api = {
 
     if (!res.ok) {
       const err = await res.json().catch(() => ({ error: 'Unknown server error' }));
-      throw new Error(err.error || `OpenRouter server error (${res.status})`);
+      throw new Error(err.error || `NVIDIA OpenRouter server error (${res.status})`);
     }
 
     const data = await res.json();
@@ -71,11 +78,11 @@ export const api = {
     return res.json();
   },
 
-  async analyzeScreen(imageBase64: string, prompt?: string, settings?: Partial<AppSettings>) {
+  async analyzeScreen(imageBase64: string, prompt?: string, _settings?: Partial<AppSettings>) {
     const res = await fetchWithTimeout('/api/jarvis/analyze-screen', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ imageBase64, prompt, openRouterModel: settings?.openRouterModel || FAST_AI_MODEL }),
+      body: JSON.stringify({ imageBase64, prompt, openRouterModel: FAST_AI_MODEL }),
     }, 60_000);
     if (!res.ok) {
       const err = await res.json().catch(() => ({ error: 'Vision analysis failed' }));
@@ -84,9 +91,9 @@ export const api = {
     return res.json();
   },
 
-  async testOpenRouterKey(apiKey: string, model = FAST_AI_MODEL) {
+  async testOpenRouterKey(apiKey: string, _model = FAST_AI_MODEL) {
     const res = await fetchWithTimeout('/api/openrouter/test', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ apiKey, model }),
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ apiKey, model: FAST_AI_MODEL }),
     }, 20_000);
     const data = await res.json();
     if (!res.ok || !data.success) throw new Error(data.error || `HTTP ${res.status}: Failed to connect to OpenRouter`);
@@ -152,13 +159,14 @@ export const api = {
 
   async getSettings(): Promise<AppSettings> {
     const saved = localStorage.getItem('jarvis_settings');
-    if (saved) { try { return JSON.parse(saved); } catch (_) {} }
-    return {} as AppSettings;
+    if (saved) {
+      try { return normalizeSettings(JSON.parse(saved)); } catch (_) {}
+    }
+    return normalizeSettings();
   },
 
   async saveSettings(settings: AppSettings) {
-    const normalized = { ...settings, aiProvider: 'openrouter', openRouterModel: settings.openRouterModel || FAST_AI_MODEL };
-    localStorage.setItem('jarvis_settings', JSON.stringify(normalized));
-    return { status: 'ok' };
+    localStorage.setItem('jarvis_settings', JSON.stringify(normalizeSettings(settings)));
+    return { status: 'ok', model: FAST_AI_MODEL };
   },
 };
