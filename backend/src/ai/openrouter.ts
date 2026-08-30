@@ -5,6 +5,8 @@ const DEFAULT_OPENROUTER_MODEL = 'minimax/minimax-m3:free';
 const REQUEST_TIMEOUT_MS = 45_000;
 const MAX_TOOL_ROUNDS = 4;
 
+// Keep the autonomous surface deliberately small and deterministic. Dangerous
+// actions are excluded and remain UI-confirmed operations.
 const AI_TOOL_NAMES = new Set([
   'open_application',
   'close_application',
@@ -17,10 +19,6 @@ const AI_TOOL_NAMES = new Set([
   'double_click_mouse',
   'take_screenshot',
   'open_url',
-  'browser_open',
-  'browser_click',
-  'browser_type',
-  'browser_press',
   'list_files',
   'search_files',
   'create_folder',
@@ -113,21 +111,16 @@ export class OpenRouterService {
 
   private buildMessages(options: OpenRouterRequestOptions) {
     const memoryContext = db.getMemories().map((m) => `- ${m.key}: ${m.value}`).join('\n');
-    const language = options.language || 'auto';
     const systemPrompt = `You are J.A.R.V.I.S., the user's personal Windows AI command assistant.
 Be concise, intelligent, polite, and action-oriented. Support English, Hindi, and natural Hinglish.
-When a request requires a desktop action, use the available tool instead of merely describing what the user could do.
-Never claim a desktop action succeeded unless the tool result reports success.
-For dangerous operations such as shutdown, restart, deletion, or sleep, do not invoke the tool unless the user has explicitly confirmed it through the UI.
-Language preference: ${language}.
+Use tools for desktop actions when appropriate. Never claim an action succeeded unless the tool result says success.
+Do not invoke dangerous/destructive operations; those require an explicit confirmation UI.
+Language preference: ${options.language || 'auto'}.
 Known user memories:\n${memoryContext || '(none)'}`;
 
     const history = (options.conversationHistory || [])
       .slice(-8)
-      .map((m) => ({
-        role: m.sender === 'user' ? 'user' : 'assistant',
-        content: m.text,
-      }));
+      .map((m) => ({ role: m.sender === 'user' ? 'user' : 'assistant', content: m.text }));
 
     return [
       { role: 'system', content: systemPrompt },
@@ -138,12 +131,10 @@ Known user memories:\n${memoryContext || '(none)'}`;
 
   public async sendMessage(options: OpenRouterRequestOptions): Promise<OpenRouterResponse> {
     const apiKey = this.getApiKey(options.apiKey);
-    if (!apiKey) {
-      throw new Error('OPENROUTER_API_KEY is not configured. Add your OpenRouter key in JARVIS Settings or the Render environment.');
-    }
+    if (!apiKey) throw new Error('OPENROUTER_API_KEY is not configured. Add your OpenRouter key in JARVIS Settings or Render.');
 
     let model = resolveModel(options.model);
-    let messages: any[] = this.buildMessages(options);
+    const messages: any[] = this.buildMessages(options);
     const toolCalls: ToolCallInfo[] = [];
 
     for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
@@ -157,9 +148,9 @@ Known user memories:\n${memoryContext || '(none)'}`;
       }, apiKey);
 
       if (!response.ok) {
-        const errorText = await response.text();
-        const isToolOrModelError = response.status === 400 && /tool|function|model|badrequest|unsupported/i.test(errorText);
-        if (isToolOrModelError && model !== DEFAULT_OPENROUTER_MODEL) {
+        const firstError = await response.text();
+        const shouldRetryWithDefault = response.status === 400 && /tool|function|model|badrequest|unsupported/i.test(firstError);
+        if (shouldRetryWithDefault && model !== DEFAULT_OPENROUTER_MODEL) {
           model = DEFAULT_OPENROUTER_MODEL;
           response = await this.request({
             model,
@@ -170,31 +161,26 @@ Known user memories:\n${memoryContext || '(none)'}`;
             max_tokens: 1024,
           }, apiKey);
         }
-
         if (!response.ok) {
-          const retryError = await response.text();
-          const plainResponse = await this.request({
-            model: DEFAULT_OPENROUTER_MODEL,
-            messages,
-            temperature: 0.2,
-            max_tokens: 1024,
-          }, apiKey);
+          const finalError = await response.text();
+          // Never let a provider-side tool validation error take down basic chat.
+          const plainResponse = await this.request({ model: DEFAULT_OPENROUTER_MODEL, messages, temperature: 0.2, max_tokens: 1024 }, apiKey);
           if (plainResponse.ok) {
             const plainData: any = await plainResponse.json();
             return {
               source: 'openrouter',
               model: DEFAULT_OPENROUTER_MODEL,
-              text: plainData.choices?.[0]?.message?.content?.trim() || 'I am online, Sir, but the tool interface needs attention.',
+              text: plainData.choices?.[0]?.message?.content?.trim() || 'I am online, Sir.',
               toolCalls,
             };
           }
-          throw new Error(`OpenRouter error (${response.status}): ${retryError || errorText}`);
+          throw new Error(`OpenRouter error (${response.status}): ${finalError || firstError}`);
         }
       }
 
       const data: any = await response.json();
       const message = data.choices?.[0]?.message;
-      const calls = message?.tool_calls || [];
+      const calls = Array.isArray(message?.tool_calls) ? message.tool_calls : [];
 
       if (!calls.length) {
         return {
@@ -210,14 +196,12 @@ Known user memories:\n${memoryContext || '(none)'}`;
       for (const call of calls) {
         const name = call?.function?.name || '';
         let args: Record<string, any> = {};
-        try {
-          args = JSON.parse(call?.function?.arguments || '{}');
-        } catch (_) {}
+        try { args = JSON.parse(call?.function?.arguments || '{}'); } catch (_) {}
 
         let result: any;
         try {
           if (!AI_TOOL_NAMES.has(name) || !options.executeTool) {
-            result = { success: false, error: `Tool ${name} is not available in this execution context.` };
+            result = { success: false, error: `Tool ${name} is not available.` };
           } else {
             result = await options.executeTool(name, args);
           }
@@ -225,15 +209,14 @@ Known user memories:\n${memoryContext || '(none)'}`;
           result = { success: false, error: error?.message || String(error) };
         }
 
-        const toolCallInfo: ToolCallInfo = {
+        toolCalls.push({
           id: call?.id || `tool_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
           name,
           arguments: args,
           result,
           status: result?.success === false ? 'failed' : 'success',
           timestamp: new Date().toISOString(),
-        };
-        toolCalls.push(toolCallInfo);
+        });
 
         messages.push({
           role: 'tool',
@@ -246,7 +229,7 @@ Known user memories:\n${memoryContext || '(none)'}`;
     return {
       source: 'openrouter',
       model,
-      text: 'I completed the requested tool steps, Sir.',
+      text: 'The requested actions were processed, Sir.',
       toolCalls,
     };
   }
