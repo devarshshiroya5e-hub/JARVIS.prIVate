@@ -3,11 +3,18 @@ import { WebSocketMessage } from '../../shared/types';
 type MessageHandler = (message: WebSocketMessage) => void;
 type StatusHandler = (connected: boolean, source: 'backend' | 'agent') => void;
 
+type PendingRequest = {
+  resolve: (value: any) => void;
+  reject: (reason?: any) => void;
+  timeoutId: number;
+};
+
 export class JarvisWebSocketClient {
   private agentWs: WebSocket | null = null;
   private backendWs: WebSocket | null = null;
   private messageHandlers: Set<MessageHandler> = new Set();
   private statusHandlers: Set<StatusHandler> = new Set();
+  private pendingRequests = new Map<string, PendingRequest>();
   private agentPort = 8765;
   private reconnectTimeout: number | null = null;
   private backendReconnectTimeout: number | null = null;
@@ -18,6 +25,9 @@ export class JarvisWebSocketClient {
 
   constructor() {
     this.init();
+    // Auto-discover the local Windows agent. Failures remain silent and retry in
+    // the background so the web-only JARVIS still works without the companion.
+    this.enableAgent();
   }
 
   public setAgentPort(port: number) {
@@ -27,8 +37,6 @@ export class JarvisWebSocketClient {
 
   public init() {
     this.connectBackend();
-    // The Windows bridge is optional. Do not open localhost:8765 on every
-    // page load when the companion agent is not installed/running.
   }
 
   public enableAgent() {
@@ -65,28 +73,45 @@ export class JarvisWebSocketClient {
     try {
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
       const wsUrl = `${protocol}//${window.location.host}/ws`;
-      this.backendWs = new WebSocket(wsUrl);
+      const ws = new WebSocket(wsUrl);
+      this.backendWs = ws;
 
-      this.backendWs.onopen = () => {
+      ws.onopen = () => {
         this.backendConnected = true;
         this.notifyStatus(true, 'backend');
+        // Let the backend know whether this browser currently has a local agent.
+        this.sendAgentStatusToBackend(this.agentConnected);
       };
 
-      this.backendWs.onmessage = (event) => {
-        try { this.notifyMessage(JSON.parse(event.data) as WebSocketMessage); } catch (_) {}
+      ws.onmessage = (event) => {
+        try {
+          const msg = JSON.parse(event.data) as WebSocketMessage;
+          // Backend-originated tool calls must execute on this browser's agent.
+          if (msg.type === 'execute_tool') {
+            this.forwardBackendToolToAgent(msg);
+            return;
+          }
+          this.resolvePending(msg);
+          this.notifyMessage(msg);
+        } catch (_) {}
       };
 
-      this.backendWs.onclose = () => {
+      ws.onclose = () => {
         this.backendConnected = false;
         this.notifyStatus(false, 'backend');
+        for (const [requestId, pending] of this.pendingRequests) {
+          window.clearTimeout(pending.timeoutId);
+          pending.reject(new Error('JARVIS backend connection closed.'));
+          this.pendingRequests.delete(requestId);
+        }
         if (this.backendReconnectTimeout !== null) window.clearTimeout(this.backendReconnectTimeout);
         this.backendReconnectTimeout = window.setTimeout(() => {
           this.backendReconnectTimeout = null;
           this.connectBackend();
-        }, 3000);
+        }, 2000);
       };
 
-      this.backendWs.onerror = () => {
+      ws.onerror = () => {
         this.backendConnected = false;
         this.notifyStatus(false, 'backend');
       };
@@ -109,26 +134,37 @@ export class JarvisWebSocketClient {
         this.agentConnected = true;
         this.reconnectAttempts = 0;
         this.notifyStatus(true, 'agent');
+        this.sendAgentStatusToBackend(true);
       };
 
       ws.onmessage = (event) => {
-        try { this.notifyMessage(JSON.parse(event.data) as WebSocketMessage); } catch (_) {}
+        try {
+          const msg = JSON.parse(event.data) as WebSocketMessage;
+          // Forward local-agent results back through the cloud/server socket so
+          // a pending AI tool call can continue its reasoning loop.
+          if (this.backendWs?.readyState === WebSocket.OPEN && (msg.type === 'tool_result' || msg.type === 'error')) {
+            this.backendWs.send(JSON.stringify(msg));
+          }
+          this.notifyMessage(msg);
+        } catch (_) {}
       };
 
       ws.onclose = () => {
         if (this.agentWs === ws) this.agentWs = null;
         const wasConnected = this.agentConnected;
         this.agentConnected = false;
-        if (wasConnected) this.notifyStatus(false, 'agent');
+        if (wasConnected) {
+          this.notifyStatus(false, 'agent');
+          this.sendAgentStatusToBackend(false);
+        }
         this.scheduleAgentReconnect();
       };
 
-      // Deliberately do not log or surface localhost connection failures.
-      // The companion is optional and may simply be stopped/uninstalled.
       ws.onerror = () => {
         if (this.agentConnected) {
           this.agentConnected = false;
           this.notifyStatus(false, 'agent');
+          this.sendAgentStatusToBackend(false);
         }
       };
     } catch (_) {
@@ -140,7 +176,7 @@ export class JarvisWebSocketClient {
 
   private scheduleAgentReconnect() {
     if (!this.agentEnabled || this.reconnectTimeout !== null) return;
-    const delay = Math.min(5000 * Math.pow(1.5, this.reconnectAttempts), 30000);
+    const delay = Math.min(1500 * Math.pow(1.6, this.reconnectAttempts), 15000);
     this.reconnectAttempts++;
     this.reconnectTimeout = window.setTimeout(() => {
       this.reconnectTimeout = null;
@@ -157,16 +193,88 @@ export class JarvisWebSocketClient {
     this.connectAgent();
   }
 
+  public async processPrompt(prompt: string, conversationHistory: any[] = [], language = 'auto', apiKey = '', model = ''): Promise<any> {
+    const requestId = `voice_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    if (!this.backendWs || this.backendWs.readyState !== WebSocket.OPEN) {
+      this.connectBackend();
+      await new Promise((resolve) => window.setTimeout(resolve, 300));
+    }
+    if (!this.backendWs || this.backendWs.readyState !== WebSocket.OPEN) {
+      throw new Error('JARVIS backend is offline. Please refresh the page.');
+    }
+
+    const result = new Promise<any>((resolve, reject) => {
+      const timeoutId = window.setTimeout(() => {
+        this.pendingRequests.delete(requestId);
+        reject(new Error('JARVIS request timed out.'));
+      }, 60_000);
+      this.pendingRequests.set(requestId, { resolve, reject, timeoutId });
+    });
+
+    const msg: WebSocketMessage = {
+      type: 'voice_transcript',
+      requestId,
+      timestamp: new Date().toISOString(),
+      payload: {
+        transcript: prompt,
+        conversationHistory: conversationHistory.slice(-6),
+        language,
+        openRouterApiKey: apiKey,
+        openRouterModel: model,
+      },
+    };
+    this.backendWs.send(JSON.stringify(msg));
+    return result;
+  }
+
+  private resolvePending(msg: WebSocketMessage) {
+    const pending = this.pendingRequests.get(msg.requestId);
+    if (!pending) return;
+    if (msg.type !== 'jarvis_response' && msg.type !== 'error') return;
+    window.clearTimeout(pending.timeoutId);
+    this.pendingRequests.delete(msg.requestId);
+    if (msg.type === 'error') pending.reject(new Error(msg.payload?.error || 'JARVIS processing failed.'));
+    else pending.resolve(msg.payload || {});
+  }
+
+  private forwardBackendToolToAgent(msg: WebSocketMessage) {
+    if (this.agentWs?.readyState === WebSocket.OPEN) {
+      this.agentWs.send(JSON.stringify(msg));
+      return;
+    }
+    const error: WebSocketMessage = {
+      type: 'tool_result',
+      requestId: msg.requestId,
+      timestamp: new Date().toISOString(),
+      payload: {
+        tool: msg.payload?.tool,
+        success: false,
+        error: 'Windows Local Agent is offline. Start windows-agent/agent.py on this PC and try again.',
+      },
+    };
+    if (this.backendWs?.readyState === WebSocket.OPEN) this.backendWs.send(JSON.stringify(error));
+  }
+
+  private sendAgentStatusToBackend(connected: boolean) {
+    if (this.backendWs?.readyState !== WebSocket.OPEN) return;
+    const msg: WebSocketMessage = {
+      type: 'agent_status',
+      requestId: `agent_status_${Date.now()}`,
+      timestamp: new Date().toISOString(),
+      payload: { status: connected ? 'connected' : 'disconnected', agentConnected: connected },
+    };
+    try { this.backendWs.send(JSON.stringify(msg)); } catch (_) {}
+  }
+
   public send(message: Partial<WebSocketMessage>) {
     const fullMsg: WebSocketMessage = {
       type: message.type || 'execute_tool',
-      requestId: message.requestId || `req_${Date.now()}`,
+      requestId: message.requestId || `req_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
       timestamp: new Date().toISOString(),
       payload: message.payload || {},
     };
     const text = JSON.stringify(fullMsg);
-
-    if (this.agentWs?.readyState === WebSocket.OPEN) {
+    if (this.agentWs?.readyState === WebSocket.OPEN && fullMsg.type === 'execute_tool') {
       this.agentWs.send(text);
       return;
     }
